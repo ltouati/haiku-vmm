@@ -1,8 +1,8 @@
 use clap::Parser;
-use log::{info};
-use nvmm::{NvmmSystem};
-use std::path::PathBuf;
+use log::info;
+use nvmm::NvmmSystem;
 use nvmm::linux::Linux64Guest;
+use std::path::PathBuf;
 
 /// Simple VMM to boot Linux
 #[derive(Parser, Debug)]
@@ -13,7 +13,10 @@ struct Args {
     kernel: PathBuf,
 
     /// Kernel command line parameters
-    #[arg(long, default_value = "console=ttyS0 earlyprintk=serial reboot=k panic=1 pci=off nomodule acpi=off noapic virtio_mmio.device=512@0xd0000000:3 nokaslr")]
+    #[arg(
+        long,
+        default_value = "console=ttyS0 earlyprintk=serial reboot=k panic=1 pci=off nomodule acpi=off noapic virtio_mmio.device=512@0xd0000000:3 nokaslr"
+    )]
     cmdline: String,
 
     /// RAM size in MiB
@@ -35,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let (guest_mem, mut vcpu) = guest.load(&mut machine)?;
 
     // Run the guest
-    guest.run(&mut vcpu, &guest_mem)?;
+    guest.run(&mut vcpu, &guest_mem).await?;
 
     Ok(())
 }

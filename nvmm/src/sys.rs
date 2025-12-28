@@ -77,14 +77,14 @@ pub struct NvmmCommPage {
 pub const NVMM_X64_NSEG: usize = 10;
 pub const NVMM_X64_NGPR: usize = 18;
 pub const NVMM_X64_NCR: usize = 6;
-pub const NVMM_X64_NDR: usize = 6; 
+pub const NVMM_X64_NDR: usize = 6;
 pub const NVMM_X64_NMSR: usize = 11;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NvmmX64StateSeg {
     pub selector: u16,
-    pub attrib: u16, 
+    pub attrib: u16,
     pub limit: u32,
     pub base: u64,
 }
@@ -92,7 +92,7 @@ pub struct NvmmX64StateSeg {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NvmmX64StateIntr {
-    pub int_shadow: u64, 
+    pub int_shadow: u64,
 }
 
 #[repr(C)]
@@ -103,11 +103,11 @@ pub struct NvmmX64StateFpu {
     pub fx_tw: u8,
     pub fx_zero: u8,
     pub fx_opcode: u16,
-    pub fx_ip: u64, 
-    pub fx_dp: u64, 
+    pub fx_ip: u64,
+    pub fx_dp: u64,
     pub fx_mxcsr: u32,
     pub fx_mxcsr_mask: u32,
-    pub fx_87_ac: [u8; 16 * 8], 
+    pub fx_87_ac: [u8; 16 * 8],
     pub fx_xmm: [u8; 16 * 16],
     pub fx_rsvd: [u8; 96],
 }
@@ -118,7 +118,9 @@ impl std::fmt::Debug for NvmmX64StateFpu {
     }
 }
 impl Default for NvmmX64StateFpu {
-    fn default() -> Self { unsafe { std::mem::zeroed() } }
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
 }
 
 #[repr(C)]
@@ -129,7 +131,7 @@ pub struct NvmmX64State {
     pub crs: [u64; NVMM_X64_NCR],
     pub drs: [u64; NVMM_X64_NDR],
     pub msrs: [u64; NVMM_X64_NMSR],
-    pub intr: u64, 
+    pub intr: u64,
     pub fpu: NvmmX64StateFpu,
 }
 
@@ -188,14 +190,13 @@ pub union NvmmX64ExitUnion {
     pub rdmsr: NvmmX64ExitRdMsr,
     pub wrmsr: NvmmX64ExitWrMsr,
     pub inv: NvmmX64ExitInvalid,
-    pub pad: [u8; 256], 
+    pub pad: [u8; 256],
 }
 impl std::fmt::Debug for NvmmX64ExitUnion {
-     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "NvmmX64ExitUnion {{ ... }}")
     }
 }
-
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -232,7 +233,6 @@ impl std::fmt::Debug for NvmmX64EventUnion {
         write!(f, "NvmmX64EventUnion")
     }
 }
-
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -289,15 +289,27 @@ unsafe extern "C" {
     pub fn nvmm_init() -> c_int;
     pub fn nvmm_machine_create(mach: *mut NvmmMachine) -> c_int;
     pub fn nvmm_machine_destroy(mach: *mut NvmmMachine) -> c_int;
-    
-    pub fn nvmm_vcpu_create(mach: *mut NvmmMachine, cpuid: NvmmCpuid, vcpu: *mut NvmmVcpu) -> c_int;
+
+    pub fn nvmm_vcpu_create(mach: *mut NvmmMachine, cpuid: NvmmCpuid, vcpu: *mut NvmmVcpu)
+    -> c_int;
     pub fn nvmm_vcpu_destroy(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu) -> c_int;
-    pub fn nvmm_vcpu_configure(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu, key: u64, value: *mut c_void) -> c_int;
+    pub fn nvmm_vcpu_configure(
+        mach: *mut NvmmMachine,
+        vcpu: *mut NvmmVcpu,
+        key: u64,
+        value: *mut c_void,
+    ) -> c_int;
     pub fn nvmm_vcpu_run(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu) -> c_int;
-    
+
     pub fn nvmm_hva_map(mach: *mut NvmmMachine, hva: uintptr_t, size: size_t) -> c_int;
-    pub fn nvmm_gpa_map(mach: *mut NvmmMachine, hva: uintptr_t, gpa: GpAddr, size: size_t, flags: c_int) -> c_int;
-    
+    pub fn nvmm_gpa_map(
+        mach: *mut NvmmMachine,
+        hva: uintptr_t,
+        gpa: GpAddr,
+        size: size_t,
+        flags: c_int,
+    ) -> c_int;
+
     pub fn nvmm_vcpu_getstate(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu, flags: u64) -> c_int;
     pub fn nvmm_vcpu_setstate(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu, flags: u64) -> c_int;
     pub fn nvmm_vcpu_inject(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu) -> c_int;

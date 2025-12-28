@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub struct SerialConsole {
     /// Input buffer for characters received from stdin
@@ -15,8 +15,6 @@ impl Default for SerialConsole {
         Self::new()
     }
 }
-
-
 
 impl SerialConsole {
     pub fn new() -> Self {
@@ -42,12 +40,16 @@ impl SerialConsole {
             }
             1 => {
                 // IER: Interrupt Enable Register
-                if self.interrupt_enable.load(Ordering::Relaxed) { 1 } else { 0 }
+                if self.interrupt_enable.load(Ordering::Relaxed) {
+                    1
+                } else {
+                    0
+                }
             }
             2 => {
-                 // IIR: Interrupt Identification Register
-                 // 0xC1 = FIFO enabled, no interrupt pending
-                 0xC1 
+                // IIR: Interrupt Identification Register
+                // 0xC1 = FIFO enabled, no interrupt pending
+                0xC1
             }
             3 => {
                 // LCR: Line Control Register
@@ -61,9 +63,10 @@ impl SerialConsole {
                 // LSR: Line Status Register
                 let mut lsr = 0x60; // THRE | TEMT (Transmitter Empty)
                 if let Ok(buf) = self.buffer.lock()
-                    && !buf.is_empty() {
-                        lsr |= 0x1; // DR (Data Ready)
-                    }
+                    && !buf.is_empty()
+                {
+                    lsr |= 0x1; // DR (Data Ready)
+                }
                 lsr
             }
             6 => {
@@ -80,7 +83,7 @@ impl SerialConsole {
 
     /// Write to a serial port register
     pub fn write(&self, offset: u16, val: u8) {
-         match offset {
+        match offset {
             0 => {
                 // THR: Transmitter Holding Register (Write Only)
                 // Output to stdout
@@ -89,10 +92,11 @@ impl SerialConsole {
             }
             1 => {
                 // IER
-                self.interrupt_enable.store((val & 0x1) != 0, Ordering::Relaxed);
+                self.interrupt_enable
+                    .store((val & 0x1) != 0, Ordering::Relaxed);
             }
             _ => {}
-         }
+        }
     }
 
     /// Add data to the input buffer (called from stdin thread)

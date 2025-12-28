@@ -1,4 +1,3 @@
-
 use log::debug;
 
 pub const APIC_BASE: u64 = 0xFEE00000;
@@ -35,9 +34,7 @@ impl Default for Lapic {
 
 impl Lapic {
     pub fn new() -> Self {
-        let mut lapic = Lapic {
-            regs: [0; 1024],
-        };
+        let mut lapic = Lapic { regs: [0; 1024] };
         lapic.reset();
         lapic
     }
@@ -45,12 +42,12 @@ impl Lapic {
     pub fn reset(&mut self) {
         // Set default values (simplified)
         self.write_reg(APIC_VER, 0x50014); // Version 0x14, Max LVT 5
-        self.write_reg(APIC_SVR, 0xFF);    // Spurious Vector Reg (enabled)
+        self.write_reg(APIC_SVR, 0xFF); // Spurious Vector Reg (enabled)
         self.write_reg(APIC_LVT_LINT0, 0x10000); // Masked
         self.write_reg(APIC_LVT_LINT1, 0x10000); // Masked
         self.write_reg(APIC_LVT_ERROR, 0x10000); // Masked
         self.write_reg(APIC_LVT_TIMER, 0x10000); // Masked
-        self.write_reg(APIC_TMR_DIV, 0xB);       // Divide by 1
+        self.write_reg(APIC_TMR_DIV, 0xB); // Divide by 1
     }
 
     fn read_reg(&self, offset: u32) -> u32 {
@@ -79,11 +76,11 @@ impl Lapic {
     pub fn write(&mut self, offset: u64, val: u32) {
         let offset = offset as u32;
         debug!("LAPIC Write: Offset={:#x} Val={:#x}", offset, val);
-        
+
         match offset {
             APIC_EOI => {
                 // End of Interrupt - Acknowledge irq (simplification: do nothing for now)
-                self.write_reg(APIC_EOI, 0); 
+                self.write_reg(APIC_EOI, 0);
             }
             APIC_ICR_LOW => {
                 // When writing to ICR_LOW, we clear the Delivery Status bit (bit 12)

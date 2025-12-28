@@ -53,19 +53,19 @@ impl VirtioDevice for ConsoleDevice {
     fn device_type(&self) -> u32 {
         3 // Console
     }
-    
+
     fn queue_max_size(&self) -> u16 {
         256
     }
-    
+
     fn activate(&mut self, _mem: GuestMemoryMmap) {
         // Activation hook
     }
-    
+
     fn read_config(&self, _offset: u64, _size: u32) -> u64 {
         0 // TODO: cols/rows
     }
-    
+
     fn write_config(&mut self, _offset: u64, _val: u64, _size: u32) {
         // TODO
     }
@@ -73,7 +73,7 @@ impl VirtioDevice for ConsoleDevice {
 
 pub struct MmioTransport {
     device: Box<dyn VirtioDevice>,
-    
+
     // MMIO State
     status: u32,
     interrupt_status: u32,
@@ -92,7 +92,7 @@ impl MmioTransport {
         for _ in 0..2 {
             queues.push(Queue::new(256).unwrap());
         }
-        
+
         Self {
             device,
             status: 0,
@@ -104,7 +104,7 @@ impl MmioTransport {
             guest_mem: None,
         }
     }
-    
+
     pub fn set_memory(&mut self, mem: GuestMemoryMmap) {
         self.guest_mem = Some(mem);
     }
@@ -117,20 +117,26 @@ impl MmioTransport {
             VIRTIO_MMIO_VENDOR_ID => 0x554d4551, // "QEMU"
             VIRTIO_MMIO_STATUS => self.status,
             VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status,
-            
+
             VIRTIO_MMIO_QUEUE_NUM_MAX => 256,
             VIRTIO_MMIO_QUEUE_NUM => {
-                 if let Some(q) = self.queues.get(self.queue_sel as usize) {
-                     q.size() as u32
-                 } else { 0 }
-            },
+                if let Some(q) = self.queues.get(self.queue_sel as usize) {
+                    q.size() as u32
+                } else {
+                    0
+                }
+            }
             VIRTIO_MMIO_QUEUE_READY => {
-                 if let Some(mem) = self.guest_mem.as_ref() {
-                     if let Some(q) = self.queues.get(self.queue_sel as usize) {
-                         if q.is_valid(mem) { 1 } else { 0 }
-                     } else { 0 }
-                 } else { 0 }
-            },
+                if let Some(mem) = self.guest_mem.as_ref() {
+                    if let Some(q) = self.queues.get(self.queue_sel as usize) {
+                        if q.is_valid(mem) { 1 } else { 0 }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            }
             VIRTIO_MMIO_CONFIG_GENERATION => 0,
             _ => 0,
         }
@@ -141,58 +147,58 @@ impl MmioTransport {
             VIRTIO_MMIO_STATUS => self.status = val,
             VIRTIO_MMIO_INTERRUPT_ACK => self.interrupt_status &= !val,
             VIRTIO_MMIO_QUEUE_SEL => self.queue_sel = val,
-            
+
             VIRTIO_MMIO_QUEUE_NUM => {
-                 if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
-                     q.set_size(val as u16);
-                 }
-            },
+                if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
+                    q.set_size(val as u16);
+                }
+            }
             VIRTIO_MMIO_QUEUE_DESC_LOW => {
-                 if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
-                     q.set_desc_table_address(Some(val), None);
-                 }
-            },
+                if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
+                    q.set_desc_table_address(Some(val), None);
+                }
+            }
             VIRTIO_MMIO_QUEUE_DESC_HIGH => {
-                 if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
-                     q.set_desc_table_address(None, Some(val));
-                 }
-            },
-            
+                if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
+                    q.set_desc_table_address(None, Some(val));
+                }
+            }
+
             VIRTIO_MMIO_QUEUE_AVAIL_LOW => {
-                 if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
-                     q.set_avail_ring_address(Some(val), None);
-                 }
-            },
+                if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
+                    q.set_avail_ring_address(Some(val), None);
+                }
+            }
             VIRTIO_MMIO_QUEUE_AVAIL_HIGH => {
-                 if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
-                     q.set_avail_ring_address(None, Some(val));
-                 }
-            },
-            
+                if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
+                    q.set_avail_ring_address(None, Some(val));
+                }
+            }
+
             VIRTIO_MMIO_QUEUE_USED_LOW => {
-                 if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
-                     q.set_used_ring_address(Some(val), None);
-                 }
-            },
+                if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
+                    q.set_used_ring_address(Some(val), None);
+                }
+            }
             VIRTIO_MMIO_QUEUE_USED_HIGH => {
-                 if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
-                     q.set_used_ring_address(None, Some(val));
-                 }
-            },
-            
+                if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
+                    q.set_used_ring_address(None, Some(val));
+                }
+            }
+
             VIRTIO_MMIO_QUEUE_READY => {
-                 if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
-                     q.set_ready(val == 1);
-                 }
-            },
-            
+                if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
+                    q.set_ready(val == 1);
+                }
+            }
+
             VIRTIO_MMIO_QUEUE_NOTIFY => {
                 let _queue_idx = val;
                 // debug!("VirtIO Notify Queue {}", queue_idx);
                 // In a real device, we would process the queue here.
                 // For now, just a stub acknowledgment.
                 // self.interrupt_status |= 1; // Used Buffer Notification
-            },
+            }
 
             _ => {}
         }

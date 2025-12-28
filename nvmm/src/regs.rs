@@ -4,12 +4,12 @@ use bitflags::bitflags;
 // State Masks
 pub const STATE_SEGS: u64 = 0x01;
 pub const STATE_GPRS: u64 = 0x02;
-pub const STATE_CRS: u64  = 0x04;
-pub const STATE_DRS: u64  = 0x08;
+pub const STATE_CRS: u64 = 0x04;
+pub const STATE_DRS: u64 = 0x08;
 pub const STATE_MSRS: u64 = 0x10;
 pub const STATE_INTR: u64 = 0x20;
-pub const STATE_FPU:  u64 = 0x40;
-pub const STATE_ALL: u64  = 0x7F;
+pub const STATE_FPU: u64 = 0x40;
+pub const STATE_ALL: u64 = 0x7F;
 
 // GPR Indices
 pub const GPR_RAX: usize = 0;
@@ -33,7 +33,7 @@ pub const SEG_GS: usize = 5;
 pub const SEG_GDT: usize = 6;
 pub const SEG_IDT: usize = 7;
 pub const SEG_LDT: usize = 8;
-pub const SEG_TR:  usize = 9;
+pub const SEG_TR: usize = 9;
 
 // CR Indices (NVMM ABI)
 pub const CR0: usize = 0;
@@ -90,6 +90,9 @@ bitflags! {
 }
 
 impl SegmentAttributes {
-    pub const REAL_MODE_CODE: Self = Self::from_bits_truncate(Self::PRESENT.bits() | Self::DESC_TYPE.bits() | Self::EXECUTABLE.bits() | Self::RW.bits());
-    pub const REAL_MODE_DATA: Self = Self::from_bits_truncate(Self::PRESENT.bits() | Self::DESC_TYPE.bits() | Self::RW.bits());
+    pub const REAL_MODE_CODE: Self = Self::from_bits_truncate(
+        Self::PRESENT.bits() | Self::DESC_TYPE.bits() | Self::EXECUTABLE.bits() | Self::RW.bits(),
+    );
+    pub const REAL_MODE_DATA: Self =
+        Self::from_bits_truncate(Self::PRESENT.bits() | Self::DESC_TYPE.bits() | Self::RW.bits());
 }
