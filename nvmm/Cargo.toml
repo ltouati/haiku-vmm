@@ -1,0 +1,14 @@
+[package]
+name = "nvmm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "1.0.0-alpha.1"
+bitflags = "2.10.0"
+vm-memory = { version = "0.14", features = ["backend-mmap"] }
+log = "0.4"
+futures = "0.3"
+linux-loader = { version = "0.11", features = ["bzimage", "elf"] }
+virtio-queue = "0.12.0"
+anyhow = "1.0.100"
