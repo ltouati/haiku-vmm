@@ -172,25 +172,35 @@ impl<'a> Vcpu<'a> {
     }
 
     /// Configure VCPU (e.g. CPUID).
+    #[allow(clippy::too_many_arguments)]
     pub fn configure_cpuid(
         &mut self,
         leaf: u32,
-        eax: u32,
-        ebx: u32,
-        ecx: u32,
-        edx: u32,
+        set_eax: u32,
+        set_ebx: u32,
+        set_ecx: u32,
+        set_edx: u32,
+        del_eax: u32,
+        del_ebx: u32,
+        del_ecx: u32,
+        del_edx: u32,
     ) -> Result<()> {
         let mut conf = sys::NvmmVcpuConfCpuid {
             mask: 1, // mask=1 (set), exit=0
             leaf,
             u: sys::NvmmVcpuConfCpuidUnion {
                 mask: sys::NvmmVcpuConfCpuidMask {
-                    set: sys::NvmmCpuidSet { eax, ebx, ecx, edx },
+                    set: sys::NvmmCpuidSet {
+                        eax: set_eax,
+                        ebx: set_ebx,
+                        ecx: set_ecx,
+                        edx: set_edx,
+                    },
                     del: sys::NvmmCpuidSet {
-                        eax: 0,
-                        ebx: 0,
-                        ecx: 0,
-                        edx: 0,
+                        eax: del_eax,
+                        ebx: del_ebx,
+                        ecx: del_ecx,
+                        edx: del_edx,
                     },
                 },
             },

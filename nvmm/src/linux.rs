@@ -214,6 +214,22 @@ impl Linux64Guest {
         info!("Starting VCPU...");
 
         // Initialize Devices (Thread-Safe)
+
+        // Disable XSAVE (26), OSXSAVE (27), AVX (28), F16C (29) in ECX of Leaf 1
+        // This prevents the kernel from seeing XSAVE support and hitting
+        // the "size 576 != kernel_size 0" panic in paranoid_xstate_size_valid.
+        vcpu.configure_cpuid(
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29),
+            0,
+        )?;
+
         let pit = Arc::new(Mutex::new(Pit::new()));
         let serial = Arc::new(SerialConsole::new());
         let lapic = Arc::new(Mutex::new(Lapic::new())); // Make lapic thread-safe
@@ -277,7 +293,6 @@ impl Linux64Guest {
         let slave_pic_io = slave_pic.clone();
 
         let lapic_mem = lapic.clone();
-        let virtio_mem = virtio_console.clone();
         let apic_base_ptr = apic_base.clone();
 
         let apic_base_msr = apic_base.clone();
@@ -354,8 +369,8 @@ impl Linux64Guest {
             })
             .on_memory(move |gpa, is_write, inst_len, value| {
                 let lapic = lapic_mem.clone();
-                let virtio = virtio_mem.clone();
                 let apic_base = apic_base_ptr.clone();
+                let virtio_console = virtio_console.clone();
                 Box::pin(async move {
                     let base = *apic_base.lock().unwrap() & 0xFFFFF000;
                     if gpa >= base && gpa < base + 0x1000 {
@@ -381,10 +396,10 @@ impl Linux64Guest {
                         let offset = gpa - 0xd0000000;
                         if is_write {
                             let val = value as u32;
-                            virtio.lock().unwrap().write(offset, val);
+                            virtio_console.lock().unwrap().write(offset, val);
                             Ok(crate::VmAction::AdvanceRip(inst_len as u64))
                         } else {
-                            let val = virtio.lock().unwrap().read(offset);
+                            let val = virtio_console.lock().unwrap().read(offset);
                             let new_rax = (value & !0xFFFFFFFF) | (val as u64);
                             Ok(crate::VmAction::WriteRegAndContinue {
                                 reg: regs::GPR_RAX,
