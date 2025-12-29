@@ -1,3 +1,4 @@
+use crate::memory_bus::MemoryDevice;
 use log::debug;
 
 pub const APIC_BASE: u64 = 0xFEE00000;
@@ -92,5 +93,15 @@ impl Lapic {
                 self.write_reg(offset, val);
             }
         }
+    }
+}
+
+impl MemoryDevice for Lapic {
+    fn read(&mut self, _base: u64, offset: u64) -> u64 {
+        self.read_reg(offset as u32) as u64
+    }
+
+    fn write(&mut self, _base: u64, offset: u64, val: u64) {
+        self.write_reg(offset as u32, val as u32);
     }
 }

@@ -1,3 +1,4 @@
+use crate::io_bus::IoDevice;
 use std::time::Instant;
 
 const FREQUENCY: u64 = 1193182; // 1.193182 MHz
@@ -391,5 +392,17 @@ impl Pit {
                 }
             }
         }
+    }
+}
+
+impl IoDevice for Pit {
+    fn read(&mut self, base: u16, _offset: u16) -> u8 {
+        let port = base + _offset;
+        self.read(port)
+    }
+
+    fn write(&mut self, base: u16, _offset: u16, val: u8) {
+        let port = base + _offset;
+        self.write(port, val);
     }
 }

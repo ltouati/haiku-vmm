@@ -1,3 +1,4 @@
+use crate::io_bus::IoDevice;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,5 +107,15 @@ impl SerialConsole {
                 buf.push_back(b);
             }
         }
+    }
+}
+
+impl IoDevice for SerialConsole {
+    fn read(&mut self, _base: u16, offset: u16) -> u8 {
+        SerialConsole::read(self, offset)
+    }
+
+    fn write(&mut self, _base: u16, offset: u16, val: u8) {
+        SerialConsole::write(self, offset, val);
     }
 }

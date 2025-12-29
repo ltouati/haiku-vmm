@@ -14,6 +14,9 @@ use crate::lapic::Lapic;
 use crate::pic::Pic;
 use crate::pit::Pit;
 use crate::serial::SerialConsole;
+
+use crate::io_bus::{IoBus, IoDevice};
+use crate::memory_bus::MemoryBus;
 use crate::virtio::{ConsoleDevice, MmioTransport};
 use crate::{Machine, Vcpu, lapic, regs, sys};
 use std::io::{Read, Write};
@@ -230,19 +233,36 @@ impl Linux64Guest {
             0,
         )?;
 
+        let mut io_bus = IoBus::new();
+
         let pit = Arc::new(Mutex::new(Pit::new()));
-        let serial = Arc::new(SerialConsole::new());
+        let serial = Arc::new(Mutex::new(SerialConsole::new()));
         let lapic = Arc::new(Mutex::new(Lapic::new())); // Make lapic thread-safe
 
         // Initialize PICs
         let master_pic = Arc::new(Mutex::new(Pic::new(true)));
         let slave_pic = Arc::new(Mutex::new(Pic::new(false)));
 
+        // Register Devices
+        io_bus.register(0x40..=0x43, pit.clone()); // Pit basic
+        io_bus.register(0x61..=0x61, pit.clone()); // Pit speaker
+        io_bus.register(0x3F8..=0x3FF, serial.clone()); // Serial
+        io_bus.register(0x20..=0x21, master_pic.clone()); // Master PIC
+        io_bus.register(0xA0..=0xA1, slave_pic.clone()); // Slave PIC
+
+        let pci_stub = Arc::new(Mutex::new(PciStub));
+        io_bus.register(0xCF8..=0xCFF, pci_stub);
+
+        let mut memory_bus = MemoryBus::new();
+        // Register LAPIC (Fixed Base for now)
+        memory_bus.register(0xFEE00000..=0xFEE00FFF, lapic.clone());
+
         // Initialize VirtIO
         let virtio_console = Arc::new(Mutex::new(MmioTransport::new(Box::new(
             ConsoleDevice::new(),
         ))));
         virtio_console.lock().unwrap().set_memory(guest_mem.clone());
+        memory_bus.register(0xd0000000..=0xd00001ff, virtio_console.clone());
 
         // Spawn Timer Thread
         {
@@ -275,7 +295,7 @@ impl Linux64Guest {
                 match io::stdin().read(&mut buffer) {
                     Ok(0) => break, // EOF
                     Ok(_) => {
-                        serial_in.queue_input(&buffer);
+                        serial_in.lock().unwrap().queue_input(&buffer);
                         // Simple local echo for now since we are not in raw mode
                         let _ = io::stdout().write(&buffer);
                         let _ = io::stdout().flush();
@@ -287,44 +307,23 @@ impl Linux64Guest {
 
         let apic_base = Arc::new(Mutex::new(lapic::APIC_BASE | 0x800)); // Base + Enable bit
 
-        let pit_io = pit.clone();
-        let serial_io = serial.clone();
-        let master_pic_io = master_pic.clone();
-        let slave_pic_io = slave_pic.clone();
+        // IO Bus capture
+        let io_bus_loop = io_bus.clone();
 
-        let lapic_mem = lapic.clone();
-        let apic_base_ptr = apic_base.clone();
+        // Memory Bus capture
+        let memory_bus_loop = memory_bus.clone();
 
         let apic_base_msr = apic_base.clone();
 
         vcpu.runner()
             .on_io(move |port, is_in, data, npc| {
-                let pit = pit_io.clone();
-                let serial = serial_io.clone();
-                let master_pic = master_pic_io.clone();
-                let slave_pic = slave_pic_io.clone();
+                let io_bus = io_bus_loop.clone();
                 let data = data.to_vec(); // Clone data for async block
 
                 Box::pin(async move {
                     if is_in {
-                        let val: u8;
-                        if (0x40..=0x43).contains(&port) || port == 0x61 {
-                            val = pit.lock().unwrap().read(port);
-                        } else if (0x3F8..=0x3FF).contains(&port) {
-                            val = serial.read(port - 0x3F8);
-                        } else if (0x20..=0x21).contains(&port) {
-                            val = master_pic.lock().unwrap().io_read((port - 0x20) as u8);
-                        } else if (0xA0..=0xA1).contains(&port) {
-                            val = slave_pic.lock().unwrap().io_read((port - 0xA0) as u8);
-                        } else if port == 0xcf8 || port == 0xcfc {
-                            val = 0xff; // PCI Stub
-                        } else {
-                            match port {
-                                0x3f8..=0x3ff | 0x20..=0x21 | 0xa0..=0xa1 | 0x40..=0x43 | 0x61 => {} // Handled above or ignored
-                                _ => debug!("Unhandled IO Read Port: {:#x}", port),
-                            }
-                            val = 0xff;
-                        }
+                        // IO Read
+                        let val = io_bus.read(port);
 
                         // Write result to AL (RAX low 8 bits) and update RIP
                         Ok(crate::VmAction::WriteRegMasked {
@@ -334,33 +333,9 @@ impl Linux64Guest {
                             next_rip: npc,
                         })
                     } else {
-                        // OUT
-                        if (0x3F8..=0x3FF).contains(&port) {
-                            serial.write(port - 0x3F8, data[0]);
-                        } else if (0x40..=0x43).contains(&port) || port == 0x61 {
-                            if !data.is_empty() {
-                                pit.lock().unwrap().write(port, data[0]);
-                            }
-                        } else if (0x20..=0x21).contains(&port) {
-                            if !data.is_empty() {
-                                let val = data[0];
-                                master_pic
-                                    .lock()
-                                    .unwrap()
-                                    .io_write((port - 0x20) as u8, val);
-                            }
-                        } else if (0xA0..=0xA1).contains(&port) {
-                            if !data.is_empty() {
-                                slave_pic
-                                    .lock()
-                                    .unwrap()
-                                    .io_write((port - 0xA0) as u8, data[0]);
-                            }
-                        } else {
-                            match port {
-                                0x3f8..=0x3ff | 0x20..=0x21 | 0xa0..=0xa1 | 0x40..=0x43 | 0x61 => {}
-                                _ => debug!("Unhandled IO Write Port: {:#x}", port),
-                            }
+                        // IO Write
+                        if !data.is_empty() {
+                            io_bus.write(port, data[0]);
                         }
 
                         Ok(crate::VmAction::SetRip(npc))
@@ -368,49 +343,21 @@ impl Linux64Guest {
                 })
             })
             .on_memory(move |gpa, is_write, inst_len, value| {
-                let lapic = lapic_mem.clone();
-                let apic_base = apic_base_ptr.clone();
-                let virtio_console = virtio_console.clone();
+                let memory_bus = memory_bus_loop.clone();
                 Box::pin(async move {
-                    let base = *apic_base.lock().unwrap() & 0xFFFFF000;
-                    if gpa >= base && gpa < base + 0x1000 {
-                        let offset = gpa - base;
-                        if is_write {
-                            let val = value as u32; // Assuming defaults to 32-bit access
-                            debug!("LAPIC Write: offset={:#x} val={:#x}", offset, val);
-                            lapic.lock().unwrap().write(offset, val);
-                            Ok(crate::VmAction::AdvanceRip(inst_len as u64))
-                        } else {
-                            let val = lapic.lock().unwrap().read(offset);
-                            debug!("LAPIC Read: offset={:#x} val={:#x}", offset, val);
-
-                            let new_rax = (value & !0xFFFFFFFF) | (val as u64);
-                            Ok(crate::VmAction::WriteRegAndContinue {
-                                reg: regs::GPR_RAX,
-                                val: new_rax,
-                                advance_rip: inst_len as u64,
-                            })
-                        }
-                    } else if (0xd0000000..0xd0000200).contains(&gpa) {
-                        // VirtIO MMIO
-                        let offset = gpa - 0xd0000000;
-                        if is_write {
-                            let val = value as u32;
-                            virtio_console.lock().unwrap().write(offset, val);
-                            Ok(crate::VmAction::AdvanceRip(inst_len as u64))
-                        } else {
-                            let val = virtio_console.lock().unwrap().read(offset);
-                            let new_rax = (value & !0xFFFFFFFF) | (val as u64);
-                            Ok(crate::VmAction::WriteRegAndContinue {
-                                reg: regs::GPR_RAX,
-                                val: new_rax,
-                                advance_rip: inst_len as u64,
-                            })
-                        }
+                    if is_write {
+                        memory_bus.write(gpa, value);
+                        Ok(crate::VmAction::AdvanceRip(inst_len as u64))
                     } else {
-                        // Break/Shutdown
-                        error!("Unhandled Memory Exit gpa={:#x}", gpa);
-                        Ok(crate::VmAction::Shutdown)
+                        let val = memory_bus.read(gpa);
+                        // Preserve high bits of destination register (value contains current reg value)
+                        let new_val = (value & !0xFFFFFFFF) | val;
+
+                        Ok(crate::VmAction::WriteRegAndContinue {
+                            reg: regs::GPR_RAX,
+                            val: new_val,
+                            advance_rip: inst_len as u64,
+                        })
                     }
                 })
             })
@@ -520,4 +467,14 @@ fn use_long_mode_pagetables(mem: &GuestMemoryMmap) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+struct PciStub;
+
+impl IoDevice for PciStub {
+    fn read(&mut self, _base: u16, _offset: u16) -> u8 {
+        0xff
+    }
+
+    fn write(&mut self, _base: u16, _offset: u16, _val: u8) {}
 }

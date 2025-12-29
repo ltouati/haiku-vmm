@@ -1,3 +1,4 @@
+use crate::memory_bus::MemoryDevice;
 use virtio_queue::{Queue, QueueT};
 use vm_memory::GuestMemoryMmap;
 
@@ -27,7 +28,7 @@ pub const VIRTIO_MMIO_QUEUE_USED_HIGH: u64 = 0x0a4;
 pub const VIRTIO_MMIO_CONFIG_GENERATION: u64 = 0x0fc;
 pub const VIRTIO_MMIO_CONFIG: u64 = 0x100;
 
-pub trait VirtioDevice: Send {
+pub trait VirtioDevice: Send + Sync {
     fn device_type(&self) -> u32;
     fn queue_max_size(&self) -> u16;
     fn activate(&mut self, mem: GuestMemoryMmap);
@@ -202,5 +203,15 @@ impl MmioTransport {
 
             _ => {}
         }
+    }
+}
+
+impl MemoryDevice for MmioTransport {
+    fn read(&mut self, _base: u64, offset: u64) -> u64 {
+        MmioTransport::read(self, offset) as u64
+    }
+
+    fn write(&mut self, _base: u64, offset: u64, val: u64) {
+        MmioTransport::write(self, offset, val as u32);
     }
 }

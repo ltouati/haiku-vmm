@@ -1,5 +1,7 @@
+pub mod io_bus;
 pub mod lapic;
 pub mod linux;
+pub mod memory_bus;
 pub mod pic;
 pub mod pit;
 pub mod regs;

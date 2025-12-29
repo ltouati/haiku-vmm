@@ -190,3 +190,15 @@ impl Pic {
         }
     }
 }
+
+use crate::io_bus::IoDevice;
+
+impl IoDevice for Pic {
+    fn read(&mut self, _base: u16, offset: u16) -> u8 {
+        self.io_read(offset as u8)
+    }
+
+    fn write(&mut self, _base: u16, offset: u16, val: u8) {
+        self.io_write(offset as u8, val);
+    }
+}
