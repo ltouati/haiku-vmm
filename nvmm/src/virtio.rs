@@ -1,5 +1,5 @@
-use crate::memory_bus::MemoryDevice;
 use virtio_queue::{Queue, QueueT};
+use vm_device::bus::MmioAddress;
 use vm_memory::GuestMemoryMmap;
 
 // MMIO Constants (VirtIO Spec)
@@ -206,12 +206,22 @@ impl MmioTransport {
     }
 }
 
-impl MemoryDevice for MmioTransport {
-    fn read(&mut self, _base: u64, offset: u64) -> u64 {
-        MmioTransport::read(self, offset) as u64
+use vm_device::MutDeviceMmio;
+
+impl MutDeviceMmio for MmioTransport {
+    fn mmio_read(&mut self, _base: MmioAddress, offset: u64, data: &mut [u8]) {
+        if data.len() == 4 {
+            let val = self.read(offset);
+            data.copy_from_slice(&val.to_le_bytes());
+        }
     }
 
-    fn write(&mut self, _base: u64, offset: u64, val: u64) {
-        MmioTransport::write(self, offset, val as u32);
+    fn mmio_write(&mut self, _base: MmioAddress, offset: u64, data: &[u8]) {
+        if data.len() == 4 {
+            let mut val_bytes = [0u8; 4];
+            val_bytes.copy_from_slice(data);
+            let val = u32::from_le_bytes(val_bytes);
+            self.write(offset, val);
+        }
     }
 }

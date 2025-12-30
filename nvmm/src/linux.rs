@@ -1,3 +1,4 @@
+use anyhow::{Context, anyhow};
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -10,19 +11,23 @@ use linux_loader::{
 use log::{debug, error, info};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
+use crate::i8042::I8042Wrapper;
 use crate::lapic::Lapic;
 use crate::pic::Pic;
 use crate::pit::Pit;
+use crate::rtc::RtcWrapper;
 use crate::serial::SerialConsole;
 
-use crate::io_bus::{IoBus, IoDevice};
-use crate::memory_bus::MemoryBus;
 use crate::virtio::{ConsoleDevice, MmioTransport};
 use crate::{Machine, Vcpu, lapic, regs, sys};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use vm_device::MutDevicePio;
+use vm_device::bus::{MmioAddress, MmioRange, PioAddress, PioRange};
+use vm_device::device_manager::MmioManager; // Trait for register_mmio
+use vm_device::device_manager::PioManager; // Trait for register_pio
 
 // CPU / Boot Constants
 const HIMEM_START: u64 = 0x100000;
@@ -233,36 +238,147 @@ impl Linux64Guest {
             0,
         )?;
 
-        let mut io_bus = IoBus::new();
-
+        // Initialize Devices (Thread-Safe)
         let pit = Arc::new(Mutex::new(Pit::new()));
         let serial = Arc::new(Mutex::new(SerialConsole::new()));
+        let rtc = Arc::new(Mutex::new(RtcWrapper::new()));
         let lapic = Arc::new(Mutex::new(Lapic::new())); // Make lapic thread-safe
 
         // Initialize PICs
         let master_pic = Arc::new(Mutex::new(Pic::new(true)));
         let slave_pic = Arc::new(Mutex::new(Pic::new(false)));
 
-        // Register Devices
-        io_bus.register(0x40..=0x43, pit.clone()); // Pit basic
-        io_bus.register(0x61..=0x61, pit.clone()); // Pit speaker
-        io_bus.register(0x3F8..=0x3FF, serial.clone()); // Serial
-        io_bus.register(0x20..=0x21, master_pic.clone()); // Master PIC
-        io_bus.register(0xA0..=0xA1, slave_pic.clone()); // Slave PIC
+        let debug_port = Arc::new(Mutex::new(DebugPort));
+        let i8042 = Arc::new(Mutex::new(I8042Wrapper::new()));
 
+        {
+            let mut device_mgr = vcpu
+                .machine
+                .device_mgr
+                .lock()
+                .map_err(|_| anyhow!("Failed to lock device manager"))?;
+
+            // Register Devices
+            // PIT: 0x40-0x43
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0x40), 4)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    pit.clone(),
+                )
+                .context("Failed to register PIT")?;
+            // Speaker/Control: 0x61
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0x61), 1)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    pit.clone(),
+                )
+                .context("Failed to register PIT Speaker")?;
+            // Serial: 0x3F8-0x3FF
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0x3F8), 8)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    serial.clone(),
+                )
+                .context("Failed to register Serial")?;
+            // RTC/CMOS: 0x70-0x71
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0x70), 2)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    rtc.clone(),
+                )
+                .context("Failed to register RTC")?;
+            // Debug Port / DMA Page Registers: 0x80-0x8F
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0x80), 0x10)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    debug_port,
+                )
+                .context("Failed to register Debug Port")?;
+            // I8042 Data: 0x60
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0x60), 1)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    i8042.clone(),
+                )
+                .context("Failed to register I8042 Data")?;
+            // I8042 Command/Status: 0x64
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0x64), 1)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    i8042.clone(),
+                )
+                .context("Failed to register I8042 Cmd")?;
+            // Master PIC: 0x20-0x21
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0x20), 2)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    master_pic.clone(),
+                )
+                .context("Failed to register Master PIC")?;
+            // Slave PIC: 0xA0-0xA1
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0xA0), 2)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    slave_pic.clone(),
+                )
+                .context("Failed to register Slave PIC")?; // Using slave_pic
+        }
         let pci_stub = Arc::new(Mutex::new(PciStub));
-        io_bus.register(0xCF8..=0xCFF, pci_stub);
+        // PCI Stub: 0xCF8-0xCFF
+        vcpu.machine
+            .device_mgr
+            .lock()
+            .map_err(|_| anyhow!("Failed to lock device manager"))?
+            .register_pio(
+                PioRange::new(PioAddress(0xCF8), 8)
+                    .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                pci_stub,
+            )
+            .context("Failed to register PCI Stub")?;
 
-        let mut memory_bus = MemoryBus::new();
         // Register LAPIC (Fixed Base for now)
-        memory_bus.register(0xFEE00000..=0xFEE00FFF, lapic.clone());
+        // 0xFEE00000 - 0xFEE00FFF
+        vcpu.machine
+            .device_mgr
+            .lock()
+            .map_err(|_| anyhow!("Failed to lock device manager"))?
+            .register_mmio(
+                MmioRange::new(MmioAddress(0xFEE00000), 0x1000)
+                    .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
+                lapic.clone(),
+            )
+            .context("Failed to register LAPIC")?;
 
         // Initialize VirtIO
         let virtio_console = Arc::new(Mutex::new(MmioTransport::new(Box::new(
             ConsoleDevice::new(),
         ))));
-        virtio_console.lock().unwrap().set_memory(guest_mem.clone());
-        memory_bus.register(0xd0000000..=0xd00001ff, virtio_console.clone());
+        virtio_console
+            .lock()
+            .map_err(|_| anyhow!("Failed to lock virtio console"))?
+            .set_memory(guest_mem.clone());
+        // VirtIO Console: 0xd0000000 - 0xd00001ff
+        vcpu.machine
+            .device_mgr
+            .lock()
+            .map_err(|_| anyhow!("Failed to lock device manager"))?
+            .register_mmio(
+                MmioRange::new(MmioAddress(0xd0000000), 0x200)
+                    .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
+                virtio_console.clone(),
+            )
+            .context("Failed to register VirtIO Console")?;
+
+        // Lock dropped automatically
 
         // Spawn Timer Thread
         {
@@ -306,61 +422,10 @@ impl Linux64Guest {
         });
 
         let apic_base = Arc::new(Mutex::new(lapic::APIC_BASE | 0x800)); // Base + Enable bit
-
-        // IO Bus capture
-        let io_bus_loop = io_bus.clone();
-
-        // Memory Bus capture
-        let memory_bus_loop = memory_bus.clone();
-
         let apic_base_msr = apic_base.clone();
 
         vcpu.runner()
-            .on_io(move |port, is_in, data, npc| {
-                let io_bus = io_bus_loop.clone();
-                let data = data.to_vec(); // Clone data for async block
-
-                Box::pin(async move {
-                    if is_in {
-                        // IO Read
-                        let val = io_bus.read(port);
-
-                        // Write result to AL (RAX low 8 bits) and update RIP
-                        Ok(crate::VmAction::WriteRegMasked {
-                            reg: regs::GPR_RAX,
-                            val: val as u64,
-                            mask: 0xFF,
-                            next_rip: npc,
-                        })
-                    } else {
-                        // IO Write
-                        if !data.is_empty() {
-                            io_bus.write(port, data[0]);
-                        }
-
-                        Ok(crate::VmAction::SetRip(npc))
-                    }
-                })
-            })
-            .on_memory(move |gpa, is_write, inst_len, value| {
-                let memory_bus = memory_bus_loop.clone();
-                Box::pin(async move {
-                    if is_write {
-                        memory_bus.write(gpa, value);
-                        Ok(crate::VmAction::AdvanceRip(inst_len as u64))
-                    } else {
-                        let val = memory_bus.read(gpa);
-                        // Preserve high bits of destination register (value contains current reg value)
-                        let new_val = (value & !0xFFFFFFFF) | val;
-
-                        Ok(crate::VmAction::WriteRegAndContinue {
-                            reg: regs::GPR_RAX,
-                            val: new_val,
-                            advance_rip: inst_len as u64,
-                        })
-                    }
-                })
-            })
+            // Removed on_io and on_memory, using defaults from lib.rs
             .on_msr(move |msr, is_write, val, npc| {
                 let apic_base = apic_base_msr.clone();
                 Box::pin(async move {
@@ -424,7 +489,7 @@ fn add_e820_entry(params: &mut boot_params, addr: u64, size: u64, mem_type: u32)
     params.e820_entries += 1;
 }
 
-fn use_long_mode_pagetables(mem: &GuestMemoryMmap) -> io::Result<()> {
+fn use_long_mode_pagetables(mem: &GuestMemoryMmap) -> anyhow::Result<()> {
     let pml4_addr = GuestAddress(0xa000);
     let pdpte_addr = GuestAddress(0xb000);
     let pde_addr = GuestAddress(0xc000);
@@ -436,34 +501,43 @@ fn use_long_mode_pagetables(mem: &GuestMemoryMmap) -> io::Result<()> {
     // Low Mapping (0-512GB) -> PDPTE (0xb000)
     // PML4[0] -> PDPTE | 0x3 (P|RW)
     mem.write_obj(pdpte_addr.raw_value() | 0x3, pml4_addr)
-        .unwrap();
+        .map_err(|e| anyhow!("Failed to write PML4: {:?}", e))?;
 
     // Low Mapping (0-1GB) -> PDE (0xc000)
     // PDPTE[0] -> PDE | 0x3
     mem.write_obj(pde_addr.raw_value() | 0x3, pdpte_addr)
-        .unwrap();
+        .map_err(|e| anyhow!("Failed to write PDPTE: {:?}", e))?;
 
     // High Memory / Kernel Space Mapping (-2GB)
     // Virtual 0xffffffff80000000 -> Physical 0
     // PML4[511] -> PDPTE | 0x3 (Reuse 0xb000)
     mem.write_obj(
         pdpte_addr.raw_value() | 0x3,
-        pml4_addr.checked_add(511 * 8).unwrap(),
+        pml4_addr
+            .checked_add(511 * 8)
+            .ok_or(anyhow!("PML4 Address Overflow"))?,
     )
-    .unwrap();
+    .map_err(|e| anyhow!("Failed to write PML4 high: {:?}", e))?;
 
     // PDPTE[510] -> PDE | 0x3 (Reuse 0xc000)
     mem.write_obj(
         pde_addr.raw_value() | 0x3,
-        pdpte_addr.checked_add(510 * 8).unwrap(),
+        pdpte_addr
+            .checked_add(510 * 8)
+            .ok_or(anyhow!("PDPTE Address Overflow"))?,
     )
-    .unwrap();
+    .map_err(|e| anyhow!("Failed to write PDPTE high: {:?}", e))?;
 
     // PDE[0..512] -> 2MB Pages | 0x83 (P|RW|PS) -> 0b10000011
     for i in 0..512 {
         let entry = i << 21 | 0x83;
-        mem.write_obj(entry, pde_addr.checked_add(i * 8).unwrap())
-            .unwrap();
+        mem.write_obj(
+            entry,
+            pde_addr
+                .checked_add(i * 8)
+                .ok_or(anyhow!("PDE Address Overflow"))?,
+        )
+        .map_err(|e| anyhow!("Failed to write PDE: {:?}", e))?;
     }
 
     Ok(())
@@ -471,10 +545,24 @@ fn use_long_mode_pagetables(mem: &GuestMemoryMmap) -> io::Result<()> {
 
 struct PciStub;
 
-impl IoDevice for PciStub {
-    fn read(&mut self, _base: u16, _offset: u16) -> u8 {
-        0xff
+impl MutDevicePio for PciStub {
+    fn pio_read(&mut self, _base: PioAddress, _offset: u16, data: &mut [u8]) {
+        if data.len() == 1 {
+            data[0] = 0xff;
+        }
     }
 
-    fn write(&mut self, _base: u16, _offset: u16, _val: u8) {}
+    fn pio_write(&mut self, _base: PioAddress, _offset: u16, _data: &[u8]) {}
+}
+
+struct DebugPort;
+
+impl MutDevicePio for DebugPort {
+    fn pio_read(&mut self, _base: PioAddress, _offset: u16, data: &mut [u8]) {
+        if data.len() == 1 {
+            data[0] = 0;
+        }
+    }
+
+    fn pio_write(&mut self, _base: PioAddress, _offset: u16, _data: &[u8]) {}
 }

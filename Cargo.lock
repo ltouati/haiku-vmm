@@ -349,7 +349,9 @@ dependencies = [
  "linux-loader",
  "log",
  "virtio-queue",
+ "vm-device",
  "vm-memory",
+ "vm-superio",
 ]
 
 [[package]]
@@ -617,6 +619,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "vm-device"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "599adbdaddea4947ca23c085d2b8e47f3499ccda35438424526f3853748a8eb6"
+
+[[package]]
 name = "vm-memory"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -626,6 +634,12 @@ dependencies = [
  "thiserror",
  "winapi",
 ]
+
+[[package]]
+name = "vm-superio"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4b5231d334edbc03b22704caa1a022e4c07491d6df736593f26094df8b04a51"
 
 [[package]]
 name = "vmm-cli"

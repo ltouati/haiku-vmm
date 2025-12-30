@@ -1,10 +1,10 @@
-pub mod io_bus;
+pub mod i8042;
 pub mod lapic;
 pub mod linux;
-pub mod memory_bus;
 pub mod pic;
 pub mod pit;
 pub mod regs;
+pub mod rtc;
 pub mod serial;
 pub mod sys;
 pub mod virtio;
@@ -13,6 +13,8 @@ use anyhow::{Result, anyhow};
 use futures::future::BoxFuture;
 use log::debug;
 use std::io;
+use std::sync::{Arc, Mutex};
+use vm_device::device_manager::{IoManager, MmioManager, PioManager};
 use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
 
 /// Represents the Global NVMM System.
@@ -43,13 +45,17 @@ impl NvmmSystem {
                 return Err(io::Error::last_os_error().into());
             }
         }
-        Ok(Machine { raw: raw_box })
+        Ok(Machine {
+            raw: raw_box,
+            device_mgr: Arc::new(Mutex::new(IoManager::new())),
+        })
     }
 }
 
 /// A Virtual Machine instance.
 pub struct Machine {
     raw: Box<sys::NvmmMachine>,
+    pub device_mgr: Arc<Mutex<IoManager>>,
 }
 
 impl Drop for Machine {
@@ -108,7 +114,7 @@ impl Machine {
 /// A Virtual CPU.
 pub struct Vcpu<'a> {
     _id: u32,
-    machine: &'a mut Machine,
+    pub machine: &'a mut Machine,
     raw: Box<sys::NvmmVcpu>,
 }
 
@@ -118,6 +124,7 @@ pub enum VmExit {
         port: u16,
         is_in: bool,
         data: Vec<u8>,
+        op_size: u8,
         npc: u64,
     },
     Memory {
@@ -294,6 +301,7 @@ impl<'a> Vcpu<'a> {
                         port: io_exit.port,
                         is_in: io_exit.in_,
                         data,
+                        op_size: io_exit.operand_size,
                         npc: io_exit.npc,
                     }
                 }
@@ -391,7 +399,8 @@ impl<'a> Vcpu<'a> {
     }
 }
 
-pub type IoHandler<'b> = dyn FnMut(u16, bool, &[u8], u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
+pub type IoHandler<'b> =
+    dyn FnMut(u16, bool, &[u8], u8, u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
 pub type MemoryHandler<'b> = dyn FnMut(u64, bool, u8, u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
 pub type ShutdownHandler<'b> = dyn FnMut() -> BoxFuture<'b, Result<VmAction>> + 'b;
 pub type MsrHandler<'b> = dyn FnMut(u32, bool, u64, u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
@@ -409,21 +418,63 @@ pub struct VcpuRunner<'a, 'b> {
 impl<'a, 'b> VcpuRunner<'a, 'b> {
     pub fn new(vcpu: &'b mut Vcpu<'a>) -> Self {
         use log::{error, info};
+        let device_mgr_io = vcpu.machine.device_mgr.clone();
+        let device_mgr_mem = vcpu.machine.device_mgr.clone();
         Self {
             vcpu,
-            io_handler: Box::new(|port, is_in, _, _| {
+            io_handler: Box::new(move |port, is_in, data, op_size, npc| {
+                let device_mgr = device_mgr_io.clone();
+                let data = data.to_vec();
                 Box::pin(async move {
-                    info!("Unhandled IO Exit: port={}, is_in={}", port, is_in);
-                    Ok(VmAction::Continue)
-                })
-            }),
-            memory_handler: Box::new(|gpa, is_write, _, _| {
-                Box::pin(async move {
-                    error!(
-                        "Unhandled Memory Exit: gpa={:#x}, is_write={}",
-                        gpa, is_write
-                    );
-                    Ok(VmAction::Shutdown)
+                    if !is_in {
+                        // Write
+                        device_mgr
+                            .lock()
+                            .unwrap()
+                            .pio_write(vm_device::bus::PioAddress(port), &data)
+                            .map_err(|e| {
+                                anyhow!(
+                                    "PIO Write Error: port={:#x}, data={:?}, error={:?}",
+                                    port,
+                                    data,
+                                    e
+                                )
+                            })?;
+                        Ok(VmAction::SetRip(npc))
+                    } else {
+                        // Read
+                        let mut read_data = vec![0u8; op_size as usize];
+                        device_mgr
+                            .lock()
+                            .map_err(|_| anyhow!("Failed to lock device manager"))?
+                            .pio_read(vm_device::bus::PioAddress(port), &mut read_data)
+                            .map_err(|e| {
+                                anyhow!(
+                                    "PIO Read Error: port={:#x}, size={}, error={:?}",
+                                    port,
+                                    op_size,
+                                    e
+                                )
+                            })?;
+
+                        let mut val = 0u64;
+                        for (i, byte) in read_data.iter().enumerate() {
+                            val |= (*byte as u64) << (i * 8);
+                        }
+
+                        let mask = if op_size >= 8 {
+                            0xffff_ffff_ffff_ffff
+                        } else {
+                            (1u64 << (op_size * 8)) - 1
+                        };
+
+                        Ok(VmAction::WriteRegMasked {
+                            reg: regs::GPR_RAX,
+                            val,
+                            mask,
+                            next_rip: npc,
+                        })
+                    }
                 })
             }),
             shutdown_handler: Box::new(|| {
@@ -438,6 +489,45 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
                     Ok(VmAction::Continue)
                 })
             }),
+            memory_handler: Box::new(move |gpa, is_write, _, value| {
+                let device_mgr = device_mgr_mem.clone();
+                Box::pin(async move {
+                    if is_write {
+                        // Write
+                        let val_bytes = value.to_le_bytes();
+                        device_mgr
+                            .lock()
+                            .map_err(|_| anyhow!("Failed to lock device manager"))?
+                            .mmio_write(vm_device::bus::MmioAddress(gpa), &val_bytes)
+                            .map_err(|e| {
+                                anyhow!(
+                                    "MMIO Write Error: gpa={:#x}, val={:#x}, error={:?}",
+                                    gpa,
+                                    value,
+                                    e
+                                )
+                            })?;
+                        Ok(VmAction::Continue)
+                    } else {
+                        // Read
+                        let mut data = [0u8; 8];
+                        device_mgr
+                            .lock()
+                            .map_err(|_| anyhow!("Failed to lock device manager"))?
+                            .mmio_read(vm_device::bus::MmioAddress(gpa), &mut data)
+                            .map_err(|e| {
+                                anyhow!("MMIO Read Error: gpa={:#x}, error={:?}", gpa, e)
+                            })?;
+                        let val = u64::from_le_bytes(data);
+
+                        Ok(VmAction::WriteRegAndContinue {
+                            reg: regs::GPR_RAX,
+                            val,
+                            advance_rip: 0, // Assumption: NVMM handles RIP advance on exit return?
+                        })
+                    }
+                })
+            }),
             unknown_handler: Box::new(|reason| {
                 Box::pin(async move {
                     error!("Unknown VM Exit Reason: {:#x}", reason);
@@ -449,7 +539,7 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
 
     pub fn on_io<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(u16, bool, &[u8], u64) -> BoxFuture<'b, Result<VmAction>> + 'b,
+        F: FnMut(u16, bool, &[u8], u8, u64) -> BoxFuture<'b, Result<VmAction>> + 'b,
     {
         self.io_handler = Box::new(handler);
         self
@@ -496,8 +586,9 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
                     port,
                     is_in,
                     ref data,
+                    op_size,
                     npc,
-                } => (self.io_handler)(port, is_in, data, npc).await?,
+                } => (self.io_handler)(port, is_in, data, op_size, npc).await?,
                 VmExit::Memory {
                     gpa,
                     is_write,

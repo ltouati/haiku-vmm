@@ -1,4 +1,3 @@
-use crate::io_bus::IoDevice;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,12 +109,19 @@ impl SerialConsole {
     }
 }
 
-impl IoDevice for SerialConsole {
-    fn read(&mut self, _base: u16, offset: u16) -> u8 {
-        SerialConsole::read(self, offset)
+use vm_device::MutDevicePio;
+use vm_device::bus::PioAddress;
+
+impl MutDevicePio for SerialConsole {
+    fn pio_read(&mut self, _base: PioAddress, offset: u16, data: &mut [u8]) {
+        if data.len() == 1 {
+            data[0] = SerialConsole::read(self, offset);
+        }
     }
 
-    fn write(&mut self, _base: u16, offset: u16, val: u8) {
-        SerialConsole::write(self, offset, val);
+    fn pio_write(&mut self, _base: PioAddress, offset: u16, data: &[u8]) {
+        if data.len() == 1 {
+            SerialConsole::write(self, offset, data[0]);
+        }
     }
 }

@@ -191,14 +191,19 @@ impl Pic {
     }
 }
 
-use crate::io_bus::IoDevice;
+use vm_device::MutDevicePio;
+use vm_device::bus::PioAddress;
 
-impl IoDevice for Pic {
-    fn read(&mut self, _base: u16, offset: u16) -> u8 {
-        self.io_read(offset as u8)
+impl MutDevicePio for Pic {
+    fn pio_read(&mut self, _base: PioAddress, offset: u16, _data: &mut [u8]) {
+        if _data.len() == 1 {
+            _data[0] = self.io_read(offset as u8);
+        }
     }
 
-    fn write(&mut self, _base: u16, offset: u16, val: u8) {
-        self.io_write(offset as u8, val);
+    fn pio_write(&mut self, _base: PioAddress, offset: u16, data: &[u8]) {
+        if data.len() == 1 {
+            self.io_write(offset as u8, data[0]);
+        }
     }
 }
