@@ -134,3 +134,15 @@ impl Default for ConsoleDevice {
         Self::new().expect("Failed to create ConsoleDevice")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_console_device_new() {
+        let dev = ConsoleDevice::new().unwrap();
+        assert_eq!(dev.device_type(), 3);
+        assert_eq!(dev.config.queues.len(), 2);
+    }
+}

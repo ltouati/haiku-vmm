@@ -115,3 +115,52 @@ impl MutDeviceMmio for Lapic {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lapic_reset() {
+        let lapic = Lapic::new();
+        assert_eq!(lapic.read(APIC_VER as u64), 0x50014);
+        assert_eq!(lapic.read(APIC_SVR as u64), 0xFF);
+        assert_eq!(lapic.read(APIC_LVT_TIMER as u64), 0x10000);
+    }
+
+    #[test]
+    fn test_lapic_read_write() {
+        let mut lapic = Lapic::new();
+        let offset = 0x380; // TMR_INIT_CNT
+        lapic.write(offset, 0x12345678);
+        assert_eq!(lapic.read(offset), 0x12345678);
+    }
+
+    #[test]
+    fn test_lapic_special_write() {
+        let mut lapic = Lapic::new();
+
+        // Test ICR_LOW: bit 12 (Delivery Status) should be cleared
+        lapic.write(APIC_ICR_LOW as u64, 0x1000); // Set bit 12
+        assert_eq!(lapic.read(APIC_ICR_LOW as u64) & (1 << 12), 0);
+
+        // Test EOI: should clear register in simplified impl
+        lapic.write_reg(APIC_EOI, 0x1);
+        lapic.write(APIC_EOI as u64, 0x1234);
+        assert_eq!(lapic.read(APIC_EOI as u64), 0);
+    }
+
+    #[test]
+    fn test_lapic_mmio() {
+        let mut lapic = Lapic::new();
+        let offset = 0x300; // ICR_LOW
+
+        let mut data = [0u8; 4];
+        lapic.mmio_read(MmioAddress(0), offset as u64, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 0);
+
+        lapic.mmio_write(MmioAddress(0), offset as u64, &0xdeadbeefu32.to_le_bytes());
+        // Bit 12 should be cleared
+        assert_eq!(lapic.read(offset as u64), 0xdeadbeef & !(1 << 12));
+    }
+}

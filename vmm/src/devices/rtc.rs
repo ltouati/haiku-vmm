@@ -35,3 +35,25 @@ impl MutDevicePio for RtcWrapper {
         // Ignore writes to data port 0x71
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rtc_minimal() {
+        let mut rtc = RtcWrapper::new();
+        // Write index 0x01
+        rtc.pio_write(PioAddress(0x70), 0, &[0x01]);
+        assert_eq!(rtc.index, 0x01);
+
+        // Write index 0x82 (NMI masked)
+        rtc.pio_write(PioAddress(0x70), 0, &[0x82]);
+        assert_eq!(rtc.index, 0x02);
+
+        // Data read should always be 0 in current stub
+        let mut data = [0xff];
+        rtc.pio_read(PioAddress(0x71), 0, &mut data);
+        assert_eq!(data[0], 0);
+    }
+}

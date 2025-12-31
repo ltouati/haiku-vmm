@@ -38,6 +38,7 @@ impl NvmmSystem {
         Ok(Machine {
             raw: raw_box,
             device_mgr: Arc::new(Mutex::new(IoManager::new())),
+            backend: Arc::new(crate::nvmm::backend::NvmmBackend),
         })
     }
 }

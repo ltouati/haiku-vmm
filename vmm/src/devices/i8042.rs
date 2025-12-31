@@ -75,3 +75,24 @@ impl MutDevicePio for I8042Wrapper {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_i8042_offsets() {
+        let mut i8042 = I8042Wrapper::new();
+
+        // Data port 0x60 should map to offset 0 in the device
+        // We can't easily check the internal device state without pub fields,
+        // but we can verify the wrapper calls don't crash and follow the logic.
+        let mut data = [0];
+        i8042.pio_read(PioAddress(0x60), 0, &mut data);
+        // Default I8042 status usually has some bits set (like 0x1c)
+
+        i8042.pio_read(PioAddress(0x64), 0, &mut data);
+        // Bit 1 of status is Input Buffer Full, should be 0 initially.
+        assert_eq!(data[0] & 0x02, 0);
+    }
+}

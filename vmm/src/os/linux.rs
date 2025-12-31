@@ -522,7 +522,7 @@ impl Linux64Guest {
             .on_memory(move |gpa, is_write, inst_len, inst_bytes, value| {
                 let device_mgr = device_mgr_mem.clone();
                 let guest_mem = guest_mem_handler.clone();
-                let injector = injector_handler;
+                let injector = injector_handler.clone();
 
                 Box::pin(async move {
                     let (final_len, reg, size) = if inst_len > 0 {
@@ -596,7 +596,7 @@ impl Linux64Guest {
             // Robust MSR Handler (Advance on Unknown)
             .on_msr(move |msr, is_write, val, npc| {
                 let apic_base = apic_base_msr.clone();
-                let injector = injector_msr;
+                let injector = injector_msr.clone();
                 Box::pin(async move {
                     if msr == 0x1B {
                         if is_write { *apic_base.lock().expect("Poisoned lock") = val; }
@@ -723,4 +723,91 @@ impl MutDevicePio for DebugPort {
         }
     }
     fn pio_write(&mut self, _base: PioAddress, _offset: u16, _data: &[u8]) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_make_gdt_entry() {
+        let entry = make_gdt_entry(0, 0xfffff, 0x9b, 0xa);
+        // Base 0, Limit 0xfffff, Access 0x9b, Flags 0xa
+        // Expected: ((0 & 0xff000000) << 32) (0) | ((0 & 0x00ffffff) << 16) (0) | (0xfffff & 0xffff) (0xffff) | ((0xfffff & 0xf0000) << 32) (0xf0000_00000000)
+        // Access 0x9b << 40, Flags 0xa << 52
+        assert_eq!(entry, 0x00af9b000000ffff);
+    }
+
+    #[test]
+    fn test_add_e820_entry() {
+        use linux_loader::bootparam::boot_params;
+        let mut params = boot_params::default();
+        add_e820_entry(&mut params, 0x1000, 0x2000, 1);
+        assert_eq!(params.e820_entries, 1);
+        let addr = params.e820_table[0].addr;
+        let size = params.e820_table[0].size;
+        let type_ = params.e820_table[0].type_;
+        assert_eq!(addr, 0x1000);
+        assert_eq!(size, 0x2000);
+        assert_eq!(type_, 1);
+    }
+
+    #[test]
+    fn test_pci_stub() {
+        let mut pci = PciStub;
+        let mut data = [0u8; 1];
+        pci.pio_read(PioAddress(0), 0, &mut data);
+        assert_eq!(data[0], 0xff);
+    }
+
+    #[test]
+    fn test_debug_port() {
+        let mut debug_port = DebugPort;
+        let mut data = [0u8; 1];
+        debug_port.pio_read(PioAddress(0), 0, &mut data);
+        assert_eq!(data[0], 0x00);
+    }
+
+    #[test]
+    fn test_translate_gva() {
+        let mem: GuestMemoryMmap<()> = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1024 * 1024)]).unwrap();
+
+        // Setup Page Tables for identity mapping 0->0
+        // CR3 = 0x1000
+        let cr3 = 0x1000;
+        let pml4_addr = 0x1000;
+        let pdpt_addr = 0x2000;
+        let pd_addr = 0x3000;
+        let pt_addr = 0x4000;
+
+        // PML4 Entry 0 points to PDPT
+        let pml4e = pdpt_addr | 0x3; // P, RW
+        mem.write_obj(pml4e, GuestAddress(pml4_addr)).unwrap();
+
+        // PDPT Entry 0 points to PD
+        let pdpte = pd_addr | 0x3;
+        mem.write_obj(pdpte, GuestAddress(pdpt_addr)).unwrap();
+
+        // PD Entry 0 points to PT
+        let pde = pt_addr | 0x3;
+        mem.write_obj(pde, GuestAddress(pd_addr)).unwrap();
+
+        // PT Entry 0 points to Page 0
+        let pte = 0x0 | 0x3;
+        mem.write_obj(pte, GuestAddress(pt_addr)).unwrap();
+
+        // Test Translation
+        // GVA 0 -> Phys 0
+        let res = translate_gva(&mem, cr3, 0);
+        assert_eq!(res, Some(0));
+
+        // Test Offset
+        let res = translate_gva(&mem, cr3, 0x123);
+        assert_eq!(res, Some(0x123));
+
+        // Test Unmapped
+        // PML4 Entry 1 is empty (0)
+        let res = translate_gva(&mem, cr3, 1 << 39); // Index 1 in PML4
+        assert_eq!(res, None);
+    }
 }

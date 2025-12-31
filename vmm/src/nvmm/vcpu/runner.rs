@@ -308,3 +308,210 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nvmm::Machine;
+    use crate::nvmm::Vcpu;
+    use crate::nvmm::backend::MockBackend;
+    use crate::nvmm::sys;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_runner_io() {
+        // Setup Backend
+        let backend = Arc::new(MockBackend::new());
+
+        // Queue Run Behaviors
+        // 1. IO Exit (OUT 0x80)
+        backend.queue_run_behavior(|exit| {
+            exit.reason = sys::NVMM_EXIT_IO;
+            exit.u.io = sys::NvmmX64ExitIo {
+                in_: false,
+                port: 0x80,
+                seg: 0,
+                address_size: 0,
+                operand_size: 1,
+                rep: false,
+                str_: false,
+                npc: 0x1005,
+            };
+            0
+        });
+        // 2. Shutdown Exit to break loop
+        backend.queue_run_behavior(|exit| {
+            exit.reason = sys::NVMM_EXIT_SHUTDOWN;
+            0
+        });
+
+        // Setup Machine & VCPU
+        let machine = unsafe { std::mem::zeroed::<sys::NvmmMachine>() };
+        let raw_machine = Box::new(machine);
+
+        let mut test_machine = Machine {
+            raw: raw_machine,
+            device_mgr: Arc::new(std::sync::Mutex::new(
+                vm_device::device_manager::IoManager::new(),
+            )),
+            backend: backend.clone(),
+        };
+
+        let mut vcpu = Vcpu {
+            _id: 0,
+            machine: &mut test_machine,
+            raw: Box::new(unsafe { std::mem::zeroed() }),
+        };
+        // Point exit struct to a local variable (since run() checks it)
+        // But wait, Vcpu::run does NOT use a local exit struct if we mock.
+        // Actually Vcpu::run reads `self.raw.exit`. We need to provide that storage.
+        // In the runner loop, multiple runs happen.
+        // We can make `self.raw.exit` point to a heap alloc or proper struct.
+        // Since Vcpu takes ownership of `raw` which is a Box, we can just ensure `raw.exit` is set.
+        // But `sys::NvmmVcpu` is a C struct. We need to allocate the Exit struct and link it.
+        let mut exit_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Exit>() });
+        let mut event_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Event>() });
+        let mut state_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64State>() });
+
+        (*vcpu.raw).exit = &mut *exit_struct;
+        (*vcpu.raw).event = &mut *event_struct;
+        (*vcpu.raw).state = &mut *state_struct;
+
+        // Setup IO Handler Checker
+        let io_called = Arc::new(std::sync::Mutex::new(false));
+        let io_called_clone = io_called.clone();
+
+        let runner = VcpuRunner::new(&mut vcpu)
+            .on_io(move |port, is_in, _, _, _| {
+                let io_called = io_called_clone.clone();
+                Box::pin(async move {
+                    assert_eq!(port, 0x80);
+                    assert_eq!(is_in, false);
+                    *io_called.lock().unwrap() = true;
+                    Ok(VmAction::Continue)
+                })
+            })
+            .on_shutdown(|| Box::pin(async { Ok(VmAction::Shutdown) }));
+
+        // Run
+        runner.run().await.unwrap();
+
+        assert!(*io_called.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_runner_mmio() {
+        let backend = Arc::new(MockBackend::new());
+
+        // Queue Run Behaviors
+        // 1. MMIO Exit (Write 0x1000)
+        backend.queue_run_behavior(|exit| {
+            exit.reason = sys::NVMM_EXIT_MEMORY;
+            exit.u.mem = sys::NvmmX64ExitMemory {
+                prot: 2, // Write
+                gpa: 0x1000,
+                inst_len: 2,
+                inst_bytes: [0x88, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], // Minimal fake instruction
+            };
+            0
+        });
+        // 2. Shutdown
+        backend.queue_run_behavior(|exit| {
+            exit.reason = sys::NVMM_EXIT_SHUTDOWN;
+            0
+        });
+
+        let machine = unsafe { std::mem::zeroed::<sys::NvmmMachine>() };
+        // We need a dummy raw machine
+        let raw_machine = Box::new(machine);
+
+        let mut test_machine = Machine {
+            raw: raw_machine,
+            device_mgr: Arc::new(std::sync::Mutex::new(
+                vm_device::device_manager::IoManager::new(),
+            )),
+            backend: backend.clone(),
+        };
+
+        let mut vcpu = Vcpu {
+            _id: 0,
+            machine: &mut test_machine,
+            raw: Box::new(unsafe { std::mem::zeroed() }),
+        };
+        let mut exit_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Exit>() });
+        let mut event_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Event>() });
+        let mut state_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64State>() });
+
+        (*vcpu.raw).exit = &mut *exit_struct;
+        (*vcpu.raw).event = &mut *event_struct;
+        (*vcpu.raw).state = &mut *state_struct;
+
+        let mmio_called = Arc::new(std::sync::Mutex::new(false));
+        let mmio_called_clone = mmio_called.clone();
+
+        let runner = VcpuRunner::new(&mut vcpu)
+            .on_memory(move |gpa, is_write, _, _, _| {
+                let mmio_called = mmio_called_clone.clone();
+                Box::pin(async move {
+                    assert_eq!(gpa, 0x1000);
+                    assert!(is_write);
+                    *mmio_called.lock().unwrap() = true;
+                    Ok(VmAction::Continue)
+                })
+            })
+            .on_shutdown(|| Box::pin(async { Ok(VmAction::Shutdown) }));
+
+        runner.run().await.unwrap();
+
+        assert!(*mmio_called.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_runner_shutdown() {
+        let backend = Arc::new(MockBackend::new());
+
+        // Queue Shutdown immediately
+        backend.queue_run_behavior(|exit| {
+            exit.reason = sys::NVMM_EXIT_SHUTDOWN;
+            0
+        });
+
+        let machine = unsafe { std::mem::zeroed::<sys::NvmmMachine>() };
+        let raw_machine = Box::new(machine);
+
+        let mut test_machine = Machine {
+            raw: raw_machine,
+            device_mgr: Arc::new(std::sync::Mutex::new(
+                vm_device::device_manager::IoManager::new(),
+            )),
+            backend: backend.clone(),
+        };
+
+        let mut vcpu = Vcpu {
+            _id: 0,
+            machine: &mut test_machine,
+            raw: Box::new(unsafe { std::mem::zeroed() }),
+        };
+        let mut exit_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Exit>() });
+        let mut event_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Event>() });
+        let mut state_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64State>() });
+
+        (*vcpu.raw).exit = &mut *exit_struct;
+        (*vcpu.raw).event = &mut *event_struct;
+        (*vcpu.raw).state = &mut *state_struct;
+
+        let shutdown_called = Arc::new(std::sync::Mutex::new(false));
+        let shutdown_called_clone = shutdown_called.clone();
+
+        let runner = VcpuRunner::new(&mut vcpu).on_shutdown(move || {
+            let shutdown_called = shutdown_called_clone.clone();
+            Box::pin(async move {
+                *shutdown_called.lock().unwrap() = true;
+                Ok(VmAction::Shutdown)
+            })
+        });
+
+        runner.run().await.unwrap();
+        assert!(*shutdown_called.lock().unwrap());
+    }
+}

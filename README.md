@@ -22,7 +22,7 @@ The codebase is organized into two main components:
 
 ## Features
 
-- **Hypervisor**: NetBSD NVMM.
+- **Hypervisor**: NetBSD NVMM on haiku.
 - **Guest Support**: Linux 64-bit (bzImage or ELF).
 - **Storage**: VirtIO Block device support with raw disk images.
 - **Console**: VirtIO Console and legacy Serial (UART) support.

@@ -13,6 +13,7 @@ use anyhow::{Result, anyhow};
 use iced_x86::{Decoder, DecoderOptions, OpKind};
 use log::debug;
 use std::io;
+use std::sync::Arc;
 use vm_memory::{Bytes, GuestAddress, GuestMemory};
 
 /// A Virtual CPU.
@@ -26,7 +27,12 @@ impl<'a> Vcpu<'a> {
     /// Retrieve CPU State.
     pub fn get_state(&mut self, flags: u64) -> Result<sys::NvmmX64State> {
         unsafe {
-            if sys::nvmm_vcpu_getstate(&mut *self.machine.raw, &mut *self.raw, flags) != 0 {
+            if self
+                .machine
+                .backend
+                .vcpu_getstate(&mut *self.machine.raw, &mut *self.raw, flags)
+                != 0
+            {
                 return Err(io::Error::last_os_error().into());
             }
             let comm_ptr = self.raw.state;
@@ -72,16 +78,16 @@ impl<'a> Vcpu<'a> {
             },
         };
 
-        unsafe {
-            if sys::nvmm_vcpu_configure(
+        if unsafe {
+            self.machine.backend.vcpu_configure(
                 &mut *self.machine.raw,
                 &mut *self.raw,
                 sys::NVMM_VCPU_CONF_CPUID,
                 &mut conf as *mut _ as *mut std::ffi::c_void,
-            ) != 0
-            {
-                return Err(io::Error::last_os_error().into());
-            }
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().into());
         }
         Ok(())
     }
@@ -95,7 +101,12 @@ impl<'a> Vcpu<'a> {
             }
             *comm_ptr = *state;
 
-            if sys::nvmm_vcpu_setstate(&mut *self.machine.raw, &mut *self.raw, flags) != 0 {
+            if self
+                .machine
+                .backend
+                .vcpu_setstate(&mut *self.machine.raw, &mut *self.raw, flags)
+                != 0
+            {
                 return Err(io::Error::last_os_error().into());
             }
         }
@@ -116,13 +127,17 @@ impl<'a> Vcpu<'a> {
         VcpuInjector {
             machine: mach_ptr,
             vcpu: vcpu_ptr,
+            backend: self.machine.backend.clone(),
         }
     }
 
     /// Internal function to run the CPU once.
     pub fn run(&mut self) -> Result<VmExit> {
         unsafe {
-            let ret = sys::nvmm_vcpu_run(&mut *self.machine.raw, &mut *self.raw);
+            let ret = self
+                .machine
+                .backend
+                .vcpu_run(&mut *self.machine.raw, &mut *self.raw);
             if ret != 0 {
                 let err = io::Error::last_os_error();
                 let raw_err = err.raw_os_error();
@@ -142,18 +157,28 @@ impl<'a> Vcpu<'a> {
             let exit = *exit_ptr;
             debug!("VM Exit Reason: {:#x}", exit.reason);
 
-            Ok(match exit.reason {
+            let comm_ptr = self.raw.state;
+            let state = if comm_ptr.is_null() {
+                None
+            } else {
+                Some(&*comm_ptr)
+            };
+
+            Ok(Self::handle_exit(&exit, state))
+        }
+    }
+
+    fn handle_exit(exit: &sys::NvmmX64Exit, state: Option<&sys::NvmmX64State>) -> VmExit {
+        unsafe {
+            match exit.reason {
                 sys::NVMM_EXIT_IO => {
                     let io_exit = exit.u.io;
 
                     let mut data = vec![];
                     if !io_exit.in_ {
                         // For OUT, data is in RAX (AL)
-                        // We must read state from comm page
-                        let comm_ptr = self.raw.state;
-                        // Assuming state is synced after run?
-                        if !comm_ptr.is_null() {
-                            let rax = (*comm_ptr).gprs[regs::GPR_RAX];
+                        if let Some(s) = state {
+                            let rax = s.gprs[regs::GPR_RAX];
 
                             // Iterate bytes
                             for i in 0..io_exit.operand_size {
@@ -171,8 +196,8 @@ impl<'a> Vcpu<'a> {
                     }
                 }
                 sys::NVMM_EXIT_MEMORY => {
-                    let is_write = (exit.u.mem.prot & 2) != 0;
                     let mut value = 0;
+                    let is_write = (exit.u.mem.prot & 2) != 0;
                     if is_write {
                         // Decode source value
                         let inst_slice = &exit.u.mem.inst_bytes[..exit.u.mem.inst_len as usize];
@@ -182,20 +207,17 @@ impl<'a> Vcpu<'a> {
                             let op1 = instruction.op1_kind();
                             if op1 == OpKind::Register {
                                 let reg = instruction.op1_register();
-                                let comm_ptr = self.raw.state;
-                                if !comm_ptr.is_null() {
+                                if let Some(s) = state {
                                     let gpr_idx = regs::reg_to_gpr(reg);
-                                    let full_val = (*comm_ptr).gprs[gpr_idx];
+                                    let full_val = s.gprs[gpr_idx];
 
                                     // Handle high byte registers (AH, CH, DH, BH)
-                                    // iced-x86: AH=4, CH=5, DH=6, BH=7
-                                    use iced_x86::Register;
-                                    value = match reg {
-                                        Register::AH
-                                        | Register::CH
-                                        | Register::DH
-                                        | Register::BH => (full_val >> 8) & 0xFF,
-                                        _ => full_val,
+                                    match reg {
+                                        iced_x86::Register::AH
+                                        | iced_x86::Register::CH
+                                        | iced_x86::Register::DH
+                                        | iced_x86::Register::BH => value = (full_val >> 8) & 0xFF,
+                                        _ => value = full_val,
                                     };
                                 }
                             } else {
@@ -245,7 +267,7 @@ impl<'a> Vcpu<'a> {
                     VmExit::Unknown(0xffffffffffffffff)
                 }
                 r => VmExit::Unknown(r),
-            })
+            }
         }
     }
 
@@ -267,10 +289,11 @@ impl<'a> Vcpu<'a> {
 }
 
 /// A thread-safe injector for VCPU interrupts.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct VcpuInjector {
     machine: *mut sys::NvmmMachine,
     vcpu: *mut sys::NvmmVcpu,
+    backend: Arc<dyn crate::nvmm::backend::HypervisorBackend>,
 }
 
 unsafe impl Send for VcpuInjector {}
@@ -292,7 +315,7 @@ impl VcpuInjector {
 
             *event_ptr = event;
 
-            if sys::nvmm_vcpu_inject(self.machine, self.vcpu) != 0 {
+            if self.backend.vcpu_inject(self.machine, self.vcpu) != 0 {
                 return Err(io::Error::last_os_error().into());
             }
         }
@@ -310,7 +333,7 @@ impl VcpuInjector {
     /// Retrieve CPU State (Thread-safe).
     pub fn get_state(&self, flags: u64) -> Result<sys::NvmmX64State> {
         unsafe {
-            if sys::nvmm_vcpu_getstate(self.machine, self.vcpu, flags) != 0 {
+            if self.backend.vcpu_getstate(self.machine, self.vcpu, flags) != 0 {
                 return Err(io::Error::last_os_error().into());
             }
             // The state is updated in the structure pointed to by vcpu->state
@@ -329,7 +352,7 @@ impl VcpuInjector {
                 return Err(anyhow!("Comm state is null"));
             }
             *comm_ptr = *state;
-            if sys::nvmm_vcpu_setstate(self.machine, self.vcpu, flags) != 0 {
+            if self.backend.vcpu_setstate(self.machine, self.vcpu, flags) != 0 {
                 return Err(io::Error::last_os_error().into());
             }
             Ok(())
@@ -425,5 +448,374 @@ impl VcpuInjector {
 
         let _ = self.dump(); // Also dump to kernel log
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nvmm::sys;
+
+    #[test]
+    fn test_handle_exit_io() {
+        let mut exit = sys::NvmmX64Exit {
+            reason: sys::NVMM_EXIT_IO,
+            u: unsafe { std::mem::zeroed() },
+            exitstate: 0,
+        };
+        exit.u.io = sys::NvmmX64ExitIo {
+            in_: false,
+            port: 0x3f8,
+            seg: 0,
+            address_size: 4,
+            operand_size: 1,
+            rep: false,
+            str_: false,
+            npc: 0x1234,
+        };
+
+        let mut state = sys::NvmmX64State::default();
+        state.gprs[regs::GPR_RAX] = 0x41; // 'A'
+
+        let vm_exit = Vcpu::handle_exit(&exit, Some(&state));
+        match vm_exit {
+            VmExit::Io {
+                port, is_in, data, ..
+            } => {
+                assert_eq!(port, 0x3f8);
+                assert_eq!(is_in, false);
+                assert_eq!(data, vec![0x41]);
+            }
+            _ => panic!("Expected Io exit"),
+        }
+    }
+
+    #[test]
+    fn test_handle_exit_io_in() {
+        let mut exit = sys::NvmmX64Exit {
+            reason: sys::NVMM_EXIT_IO,
+            u: unsafe { std::mem::zeroed() },
+            exitstate: 0,
+        };
+        exit.u.io = sys::NvmmX64ExitIo {
+            in_: true,
+            port: 0x60,
+            seg: 0,
+            address_size: 4,
+            operand_size: 1,
+            rep: false,
+            str_: false,
+            npc: 0x1234,
+        };
+
+        // For IN exits, data is not provided by guest state (it's what we need to return)
+        // But the handle_exit function constructs a VmExit::Io which should capture the intent.
+        let vm_exit = Vcpu::handle_exit(&exit, None);
+        match vm_exit {
+            VmExit::Io { port, is_in, .. } => {
+                assert_eq!(port, 0x60);
+                assert_eq!(is_in, true);
+            }
+            _ => panic!("Expected Io exit"),
+        }
+    }
+
+    #[test]
+    fn test_handle_exit_memory_read() {
+        let mut exit = sys::NvmmX64Exit {
+            reason: sys::NVMM_EXIT_MEMORY,
+            u: unsafe { std::mem::zeroed() },
+            exitstate: 0,
+        };
+        exit.u.mem = sys::NvmmX64ExitMemory {
+            prot: 1, // Read (no write bit 2 set)
+            gpa: 0x2000,
+            inst_len: 0, // Instruction fetching might be skipped for read if not needed?
+            // Actually handle_exit only decodes for Write to get the value.
+            // For read, it just passes GPA.
+            inst_bytes: [0u8; 15],
+        };
+
+        let vm_exit = Vcpu::handle_exit(&exit, None);
+        match vm_exit {
+            VmExit::Memory { gpa, is_write, .. } => {
+                assert_eq!(gpa, 0x2000);
+                assert_eq!(is_write, false);
+            }
+            _ => panic!("Expected Memory exit"),
+        }
+    }
+
+    #[test]
+    fn test_handle_exit_memory_write_imm() {
+        let mut exit = sys::NvmmX64Exit {
+            reason: sys::NVMM_EXIT_MEMORY,
+            u: unsafe { std::mem::zeroed() },
+            exitstate: 0,
+        };
+        // mov byte ptr [rax], 0x55
+        // Bytes: C6 00 55
+        let mut inst = [0u8; 15];
+        inst[0] = 0xC6;
+        inst[1] = 0x00;
+        inst[2] = 0x55;
+
+        exit.u.mem = sys::NvmmX64ExitMemory {
+            prot: 2, // Write
+            gpa: 0x1000,
+            inst_len: 3,
+            inst_bytes: inst,
+        };
+
+        let vm_exit = Vcpu::handle_exit(&exit, None);
+        match vm_exit {
+            VmExit::Memory {
+                gpa,
+                is_write,
+                value,
+                ..
+            } => {
+                assert_eq!(gpa, 0x1000);
+                assert_eq!(is_write, true);
+                assert_eq!(value, 0x55);
+            }
+            _ => panic!("Expected Memory exit"),
+        }
+    }
+
+    #[test]
+    fn test_handle_exit_memory_write_reg() {
+        let mut exit = sys::NvmmX64Exit {
+            reason: sys::NVMM_EXIT_MEMORY,
+            u: unsafe { std::mem::zeroed() },
+            exitstate: 0,
+        };
+        // mov [rax], rbx
+        // Bytes: 48 89 18
+        let mut inst = [0u8; 15];
+        inst[0] = 0x48;
+        inst[1] = 0x89;
+        inst[2] = 0x18;
+
+        exit.u.mem = sys::NvmmX64ExitMemory {
+            prot: 2, // Write
+            gpa: 0x1000,
+            inst_len: 3,
+            inst_bytes: inst,
+        };
+
+        let mut state = sys::NvmmX64State::default();
+        state.gprs[regs::GPR_RBX] = 0xDEADBEEF;
+
+        let vm_exit = Vcpu::handle_exit(&exit, Some(&state));
+        match vm_exit {
+            VmExit::Memory { value, .. } => {
+                assert_eq!(value, 0xDEADBEEF);
+            }
+            _ => panic!("Expected Memory exit"),
+        }
+    }
+
+    #[test]
+    fn test_handle_exit_memory_write_high_byte() {
+        let mut exit = sys::NvmmX64Exit {
+            reason: sys::NVMM_EXIT_MEMORY,
+            u: unsafe { std::mem::zeroed() },
+            exitstate: 0,
+        };
+        // mov [rax], ah
+        // Bytes: 88 20
+        let mut inst = [0u8; 15];
+        inst[0] = 0x88;
+        inst[1] = 0x20;
+
+        exit.u.mem = sys::NvmmX64ExitMemory {
+            prot: 2, // Write
+            gpa: 0x1000,
+            inst_len: 2,
+            inst_bytes: inst,
+        };
+
+        let mut state = sys::NvmmX64State::default();
+        state.gprs[regs::GPR_RAX] = 0x12345678; // AH is 0x56
+
+        let vm_exit = Vcpu::handle_exit(&exit, Some(&state));
+        match vm_exit {
+            VmExit::Memory { value, .. } => {
+                assert_eq!(value, 0x56);
+            }
+            _ => panic!("Expected Memory exit"),
+        }
+    }
+
+    #[test]
+    fn test_handle_exit_rdmsr() {
+        let mut exit = sys::NvmmX64Exit {
+            reason: sys::NVMM_EXIT_RDMSR,
+            u: unsafe { std::mem::zeroed() },
+            exitstate: 0,
+        };
+        exit.u.rdmsr = sys::NvmmX64ExitRdMsr {
+            msr: 0x1234,
+            _pad: 0,
+            npc: 0x5678,
+        };
+        let vm_exit = Vcpu::handle_exit(&exit, None);
+        match vm_exit {
+            VmExit::RdMsr { msr, npc } => {
+                assert_eq!(msr, 0x1234);
+                assert_eq!(npc, 0x5678);
+            }
+            _ => panic!("Expected RdMsr exit"),
+        }
+    }
+
+    #[test]
+    fn test_handle_exit_wrmsr() {
+        let mut exit = sys::NvmmX64Exit {
+            reason: sys::NVMM_EXIT_WRMSR,
+            u: unsafe { std::mem::zeroed() },
+            exitstate: 0,
+        };
+        exit.u.wrmsr = sys::NvmmX64ExitWrMsr {
+            msr: 0x1234,
+            _pad: 0,
+            val: 0xDEADBEEF,
+            npc: 0x5678,
+        };
+        let vm_exit = Vcpu::handle_exit(&exit, None);
+        match vm_exit {
+            VmExit::WrMsr { msr, val, npc } => {
+                assert_eq!(msr, 0x1234);
+                assert_eq!(val, 0xDEADBEEF);
+                assert_eq!(npc, 0x5678);
+            }
+            _ => panic!("Expected WrMsr exit"),
+        }
+    }
+
+    #[test]
+    fn test_handle_exit_shutdown() {
+        let exit = sys::NvmmX64Exit {
+            reason: sys::NVMM_EXIT_SHUTDOWN,
+            u: unsafe { std::mem::zeroed() },
+            exitstate: 0,
+        };
+        let vm_exit = Vcpu::handle_exit(&exit, None);
+        assert!(matches!(vm_exit, VmExit::Shutdown));
+    }
+
+    #[test]
+    fn test_handle_exit_invalid() {
+        let exit = sys::NvmmX64Exit {
+            reason: 0xFFFFFFFF,
+            u: unsafe { std::mem::zeroed() },
+            exitstate: 0,
+        };
+        let vm_exit = Vcpu::handle_exit(&exit, None);
+        if let VmExit::Unknown(reason) = vm_exit {
+            assert_eq!(reason, 0xFFFFFFFF);
+        } else {
+            panic!("Expected Unknown exit");
+        }
+    }
+
+    #[test]
+    fn test_vcpu_run_mock() {
+        let backend = Arc::new(crate::nvmm::backend::MockBackend::new());
+        // Set return value for vcpu_run
+        backend.queue_run_behavior(|_| 0);
+
+        let machine = unsafe { std::mem::zeroed::<sys::NvmmMachine>() };
+        let raw_machine = Box::new(machine);
+
+        let mut test_machine = crate::nvmm::Machine {
+            raw: raw_machine,
+            device_mgr: Arc::new(std::sync::Mutex::new(
+                vm_device::device_manager::IoManager::new(),
+            )),
+            backend: backend.clone(),
+        };
+
+        // Initialize fake VCPU struct
+        let mut vcpu = crate::nvmm::Vcpu {
+            _id: 0,
+            machine: &mut test_machine,
+            raw: Box::new(unsafe { std::mem::zeroed() }),
+        };
+
+        // Prepare Exit Struct
+        let mut exit_struct = sys::NvmmX64Exit {
+            reason: sys::NVMM_EXIT_IO,
+            u: unsafe { std::mem::zeroed() },
+            exitstate: 0,
+        };
+        exit_struct.u.io = sys::NvmmX64ExitIo {
+            in_: false,
+            port: 0x80,
+            seg: 0,
+            address_size: 4,
+            operand_size: 1,
+            rep: false,
+            str_: false,
+            npc: 0x1236,
+        };
+
+        // Prepare Event Struct
+        let mut event_struct = sys::NvmmX64Event {
+            type_: 0,
+            vector: 0,
+            u: unsafe { std::mem::zeroed() },
+        };
+
+        // Link raw pointers to our stack allocated structs
+        // SAFETY: vcpu.raw is Boxed, so it's stable. exit_struct and event_struct must outlive vcpu.run() call.
+        // Accessing/assigning to fields of NvmmVcpu is safe.
+        (*vcpu.raw).exit = &mut exit_struct;
+        (*vcpu.raw).event = &mut event_struct;
+
+        // Run
+        let exit = vcpu.run().unwrap();
+        match exit {
+            VmExit::Io { port, .. } => assert_eq!(port, 0x80),
+            _ => panic!("Expected IO exit"),
+        }
+    }
+
+    #[test]
+    fn test_vcpu_inject_mock() {
+        let backend = Arc::new(crate::nvmm::backend::MockBackend::new());
+        // vcpu_inject returns 0 by default in mock
+
+        let machine = unsafe { std::mem::zeroed::<sys::NvmmMachine>() };
+        let raw_machine = Box::new(machine);
+
+        let mut test_machine = crate::nvmm::Machine {
+            raw: raw_machine,
+            device_mgr: Arc::new(std::sync::Mutex::new(
+                vm_device::device_manager::IoManager::new(),
+            )),
+            backend: backend.clone(),
+        };
+
+        let mut vcpu = crate::nvmm::Vcpu {
+            _id: 0,
+            machine: &mut test_machine,
+            raw: Box::new(unsafe { std::mem::zeroed() }),
+        };
+
+        let mut event_struct = sys::NvmmX64Event {
+            type_: 0,
+            vector: 0,
+            u: unsafe { std::mem::zeroed() },
+        };
+
+        (*vcpu.raw).event = &mut event_struct;
+
+        let result = vcpu.inject_interrupt(0x20);
+        assert!(result.is_ok());
+
+        assert_eq!(event_struct.type_, sys::NVMM_VCPU_EVENT_INTR);
+        assert_eq!(event_struct.vector, 0x20);
     }
 }

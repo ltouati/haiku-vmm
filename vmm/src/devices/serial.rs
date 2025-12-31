@@ -125,3 +125,44 @@ impl MutDevicePio for SerialConsole {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serial_input() {
+        let serial = SerialConsole::new();
+        // Initially empty
+        assert_eq!(serial.read(0), 0);
+        assert_eq!(serial.read(5) & 0x01, 0); // LSR DR bit
+
+        serial.queue_input(b"ABC");
+        assert_eq!(serial.read(5) & 0x01, 0x01); // DR bit set
+
+        assert_eq!(serial.read(0), b'A');
+        assert_eq!(serial.read(0), b'B');
+        assert_eq!(serial.read(0), b'C');
+        assert_eq!(serial.read(0), 0);
+        assert_eq!(serial.read(5) & 0x01, 0); // DR bit cleared
+    }
+
+    #[test]
+    fn test_serial_ier() {
+        let serial = SerialConsole::new();
+        assert_eq!(serial.read(1), 0);
+
+        serial.write(1, 0x01); // Enable ERBFI
+        assert_eq!(serial.read(1), 1);
+
+        serial.write(1, 0x00);
+        assert_eq!(serial.read(1), 0);
+    }
+
+    #[test]
+    fn test_serial_lsr_default() {
+        let serial = SerialConsole::new();
+        // LSR should have THRE and TEMT set (0x60)
+        assert_eq!(serial.read(5) & 0x60, 0x60);
+    }
+}

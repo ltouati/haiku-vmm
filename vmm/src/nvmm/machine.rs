@@ -12,13 +12,12 @@ use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, Memory
 pub struct Machine {
     pub(crate) raw: Box<sys::NvmmMachine>,
     pub device_mgr: Arc<Mutex<IoManager>>,
+    pub(crate) backend: Arc<dyn crate::nvmm::backend::HypervisorBackend>,
 }
 
 impl Drop for Machine {
     fn drop(&mut self) {
-        unsafe {
-            sys::nvmm_machine_destroy(&mut *self.raw);
-        }
+        unsafe { self.backend.machine_destroy(&mut *self.raw) };
     }
 }
 
@@ -26,11 +25,9 @@ impl Machine {
     pub fn create_vcpu(&mut self, id: u32) -> Result<Vcpu<'_>> {
         let mut vcpu_box = Box::new(unsafe { std::mem::zeroed::<sys::NvmmVcpu>() });
 
-        unsafe {
-            debug!("Calling nvmm_vcpu_create...");
-            if sys::nvmm_vcpu_create(&mut *self.raw, id, &mut *vcpu_box) != 0 {
-                return Err(io::Error::last_os_error().into());
-            }
+        debug!("Calling nvmm_vcpu_create...");
+        if unsafe { self.backend.vcpu_create(&mut *self.raw, id, &mut *vcpu_box) } != 0 {
+            return Err(io::Error::last_os_error().into());
         }
         Ok(Vcpu {
             _id: id,
@@ -50,17 +47,23 @@ impl Machine {
                 .get_host_address(MemoryRegionAddress(0))
                 .map_err(|e| anyhow!("{:?}", e))?;
 
-            unsafe {
-                // Register HVA
-                debug!("Calling nvmm_hva_map...");
-                if sys::nvmm_hva_map(&mut *self.raw, host_ptr as usize, size) != 0 {
-                    return Err(io::Error::last_os_error().into());
-                }
-                // Map to GPA
-                debug!("Calling nvmm_gpa_map...");
-                if sys::nvmm_gpa_map(&mut *self.raw, host_ptr as usize, base, size, 7) != 0 {
-                    return Err(io::Error::last_os_error().into());
-                }
+            // Register HVA
+            debug!("Calling nvmm_hva_map...");
+            if unsafe {
+                self.backend
+                    .hva_map(&mut *self.raw, host_ptr as usize, size)
+            } != 0
+            {
+                return Err(io::Error::last_os_error().into());
+            }
+            // Map to GPA
+            debug!("Calling nvmm_gpa_map...");
+            if unsafe {
+                self.backend
+                    .gpa_map(&mut *self.raw, host_ptr as usize, base, size, 7)
+            } != 0
+            {
+                return Err(io::Error::last_os_error().into());
             }
         }
         Ok(())

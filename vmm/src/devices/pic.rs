@@ -207,3 +207,70 @@ impl MutDevicePio for Pic {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pic_basic_irq() {
+        let mut pic = Pic::new(true);
+        pic.set_irq(0, true);
+        assert_eq!(pic.get_interrupt(), Some(0x8));
+        assert_eq!(pic.ack_interrupt(), Some(0x8));
+        assert_eq!(pic.isr, 1);
+        assert_eq!(pic.irr, 0);
+
+        // Non-Specific EOI
+        pic.io_write(0, 0x20);
+        assert_eq!(pic.isr, 0);
+    }
+
+    #[test]
+    fn test_pic_masking() {
+        let mut pic = Pic::new(true);
+        pic.imr = 0x01; // Mask IRQ 0
+        pic.set_irq(0, true);
+        assert_eq!(pic.get_interrupt(), None);
+
+        pic.set_irq(1, true);
+        assert_eq!(pic.get_interrupt(), Some(0x9));
+    }
+
+    #[test]
+    fn test_pic_initialization() {
+        let mut pic = Pic::new(true);
+        // ICW1 (Init + ICW4 needed)
+        pic.io_write(0, 0x11);
+        assert_eq!(pic.state, State::Icw2);
+
+        // ICW2 (Vector Offset 0x20)
+        pic.io_write(1, 0x20);
+        assert_eq!(pic.state, State::Icw3);
+        assert_eq!(pic.vector_offset, 0x20);
+
+        // ICW3
+        pic.io_write(1, 0x04);
+        assert_eq!(pic.state, State::Icw4);
+
+        // ICW4
+        pic.io_write(1, 0x01);
+        assert_eq!(pic.state, State::Ready);
+    }
+
+    #[test]
+    fn test_pic_read_req() {
+        let mut pic = Pic::new(true);
+        pic.set_irq(2, true);
+
+        // Default read is IRR
+        assert_eq!(pic.io_read(0), 0x04);
+
+        // Switch to ISR
+        pic.io_write(0, 0x0B); // OCW3: Read ISR
+        assert_eq!(pic.io_read(0), 0x00);
+
+        pic.ack_interrupt();
+        assert_eq!(pic.io_read(0), 0x04); // Now ISR bit 2 is set
+    }
+}

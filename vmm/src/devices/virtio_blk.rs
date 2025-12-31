@@ -215,3 +215,24 @@ impl BlockDevice {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempfile;
+
+    #[test]
+    fn test_block_device_new() {
+        let file = tempfile().unwrap();
+        file.set_len(1024 * 1024).unwrap(); // 1MB
+
+        let dev = BlockDevice::new(file).unwrap();
+        assert_eq!(dev.device_type(), 2);
+
+        // 1MB = 2048 sectors (512 bytes each)
+        let mut config = [0u8; 8];
+        config.copy_from_slice(&dev.config.config_space[0..8]);
+        let capacity = u64::from_le_bytes(config);
+        assert_eq!(capacity, 2048);
+    }
+}

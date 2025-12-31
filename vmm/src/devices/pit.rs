@@ -410,3 +410,60 @@ impl MutDevicePio for Pit {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pit_rw_word() {
+        let mut pit = Pit::new();
+        // Set Channel 0 to Mode 3, RW Word (3), Binary (0)
+        // 00 (ch0) 11 (word) 011 (mode 3) 0 (binary) -> 0x36
+        pit.write(0x43, 0x36);
+
+        // Write LSB
+        pit.write(0x40, 0x00);
+        assert_eq!(pit.channel0.write_state, RwState::Word1);
+        assert_eq!(pit.channel0.write_latch, 0);
+
+        // Write MSB
+        pit.write(0x40, 0x10);
+        assert_eq!(pit.channel0.write_state, RwState::Word0);
+        assert_eq!(pit.channel0.count, 0x1000);
+    }
+
+    #[test]
+    fn test_pit_latch() {
+        let mut pit = Pit::new();
+        pit.write(0x43, 0x36);
+        pit.write(0x40, 0x00);
+        pit.write(0x40, 0x10); // Count = 0x1000
+
+        // Latch command for Ch 0
+        pit.write(0x43, 0x00);
+        assert_ne!(pit.channel0.count_latched, 0);
+
+        // Read LSB
+        let lsb = pit.read(0x40);
+        // Read MSB
+        let msb = pit.read(0x40);
+        let val = (lsb as u16) | ((msb as u16) << 8);
+
+        // Since we just loaded it, it should be near 0x1000 or slightly less
+        assert!(val <= 0x1000);
+        assert!(val > 0);
+    }
+
+    #[test]
+    fn test_pit_readback_status() {
+        let mut pit = Pit::new();
+        // ReadBack: Latch Status (bit 4=0), Ch 0 (bit 1=1)
+        // 11 (readback) 1 (count) 0 (status) 001 (ch0) 0 -> 0xE2
+        pit.write(0x43, 0xE2);
+
+        let status = pit.read(0x40);
+        // Default mode is 3, RW 3. Output should be whatever it is.
+        assert_eq!(status & 0x7F, (3 << 4) | (3 << 1) | 0);
+    }
+}

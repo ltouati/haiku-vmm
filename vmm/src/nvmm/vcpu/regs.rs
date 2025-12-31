@@ -128,3 +128,39 @@ impl SegmentAttributes {
     pub const REAL_MODE_DATA: Self =
         Self::from_bits_truncate(Self::PRESENT.bits() | Self::DESC_TYPE.bits() | Self::RW.bits());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_x86::Register;
+
+    #[test]
+    fn test_reg_to_gpr() {
+        assert_eq!(reg_to_gpr(Register::RAX), GPR_RAX);
+        assert_eq!(reg_to_gpr(Register::EAX), GPR_RAX);
+        assert_eq!(reg_to_gpr(Register::AX), GPR_RAX);
+        assert_eq!(reg_to_gpr(Register::AL), GPR_RAX);
+
+        assert_eq!(reg_to_gpr(Register::RSP), GPR_RSP);
+        assert_eq!(reg_to_gpr(Register::ESP), GPR_RSP);
+
+        assert_eq!(reg_to_gpr(Register::R15), GPR_R15);
+        assert_eq!(reg_to_gpr(Register::R15L), GPR_R15);
+
+        // RIP is not a GPR in reg_to_gpr match
+        assert_eq!(reg_to_gpr(Register::RIP), GPR_RAX); // Default case
+    }
+
+    #[test]
+    fn test_segment_attributes() {
+        let code = SegmentAttributes::REAL_MODE_CODE;
+        assert!(code.contains(SegmentAttributes::PRESENT));
+        assert!(code.contains(SegmentAttributes::EXECUTABLE));
+        assert!(code.contains(SegmentAttributes::RW));
+
+        let data = SegmentAttributes::REAL_MODE_DATA;
+        assert!(data.contains(SegmentAttributes::PRESENT));
+        assert!(!data.contains(SegmentAttributes::EXECUTABLE));
+        assert!(data.contains(SegmentAttributes::RW));
+    }
+}
