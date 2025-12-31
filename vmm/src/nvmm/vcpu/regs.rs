@@ -20,8 +20,40 @@ pub const GPR_RSP: usize = 4;
 pub const GPR_RBP: usize = 5;
 pub const GPR_RSI: usize = 6;
 pub const GPR_RDI: usize = 7;
+pub const GPR_R8: usize = 8;
+pub const GPR_R9: usize = 9;
+pub const GPR_R10: usize = 10;
+pub const GPR_R11: usize = 11;
+pub const GPR_R12: usize = 12;
+pub const GPR_R13: usize = 13;
+pub const GPR_R14: usize = 14;
+pub const GPR_R15: usize = 15;
 pub const GPR_RIP: usize = 16;
 pub const GPR_RFLAGS: usize = 17;
+
+/// Map iced-x86 Register to NVMM GPR index.
+pub fn reg_to_gpr(reg: iced_x86::Register) -> usize {
+    use iced_x86::Register;
+    match reg {
+        Register::RAX | Register::EAX | Register::AX | Register::AL => GPR_RAX,
+        Register::RCX | Register::ECX | Register::CX | Register::CL => GPR_RCX,
+        Register::RDX | Register::EDX | Register::DX | Register::DL => GPR_RDX,
+        Register::RBX | Register::EBX | Register::BX | Register::BL => GPR_RBX,
+        Register::RSP | Register::ESP | Register::SP | Register::SPL => GPR_RSP,
+        Register::RBP | Register::EBP | Register::BP | Register::BPL => GPR_RBP,
+        Register::RSI | Register::ESI | Register::SI | Register::SIL => GPR_RSI,
+        Register::RDI | Register::EDI | Register::DI | Register::DIL => GPR_RDI,
+        Register::R8 | Register::R8D | Register::R8W | Register::R8L => GPR_R8,
+        Register::R9 | Register::R9D | Register::R9W | Register::R9L => GPR_R9,
+        Register::R10 | Register::R10D | Register::R10W | Register::R10L => GPR_R10,
+        Register::R11 | Register::R11D | Register::R11W | Register::R11L => GPR_R11,
+        Register::R12 | Register::R12D | Register::R12W | Register::R12L => GPR_R12,
+        Register::R13 | Register::R13D | Register::R13W | Register::R13L => GPR_R13,
+        Register::R14 | Register::R14D | Register::R14W | Register::R14L => GPR_R14,
+        Register::R15 | Register::R15D | Register::R15W | Register::R15L => GPR_R15,
+        _ => GPR_RAX,
+    }
+}
 
 // Segment Indices (NVMM ABI)
 pub const SEG_ES: usize = 0;

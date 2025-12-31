@@ -284,6 +284,22 @@ pub const NVMM_EXIT_SHUTDOWN: u64 = 0x1000;
 pub const NVMM_EXIT_RDMSR: u64 = 0x2000;
 pub const NVMM_EXIT_WRMSR: u64 = 0x2001;
 
+// State flags
+pub const NVMM_X64_STATE_SEGS: u64 = 0x01;
+pub const NVMM_X64_STATE_GPRS: u64 = 0x02;
+pub const NVMM_X64_STATE_CRS: u64 = 0x04;
+pub const NVMM_X64_STATE_DRS: u64 = 0x08;
+pub const NVMM_X64_STATE_MSRS: u64 = 0x10;
+pub const NVMM_X64_STATE_INTR: u64 = 0x20;
+pub const NVMM_X64_STATE_FPU: u64 = 0x40;
+pub const NVMM_X64_STATE_ALL: u64 = NVMM_X64_STATE_SEGS
+    | NVMM_X64_STATE_GPRS
+    | NVMM_X64_STATE_CRS
+    | NVMM_X64_STATE_DRS
+    | NVMM_X64_STATE_MSRS
+    | NVMM_X64_STATE_INTR
+    | NVMM_X64_STATE_FPU;
+
 #[link(name = "nvmm")]
 unsafe extern "C" {
     pub fn nvmm_init() -> c_int;
@@ -313,4 +329,5 @@ unsafe extern "C" {
     pub fn nvmm_vcpu_getstate(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu, flags: u64) -> c_int;
     pub fn nvmm_vcpu_setstate(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu, flags: u64) -> c_int;
     pub fn nvmm_vcpu_inject(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu) -> c_int;
+    pub fn nvmm_vcpu_dump(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu);
 }

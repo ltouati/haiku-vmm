@@ -256,6 +256,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "iced-x86"
+version = "1.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -284,6 +293,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "lazy_static"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
@@ -336,22 +351,6 @@ dependencies = [
  "libc 0.2.178",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "nvmm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bitflags 2.10.0",
- "futures",
- "libc 1.0.0-alpha.1",
- "linux-loader",
- "log",
- "virtio-queue",
- "vm-device",
- "vm-memory",
- "vm-superio",
 ]
 
 [[package]]
@@ -493,6 +492,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc 0.2.178",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -602,15 +611,47 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "virtio-bindings"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "804f498a26d5a63be7bbb8bdcd3869c3f286c4c4a17108905276454da0caf8cb"
+version = "0.2.2"
+source = "git+https://github.com/rust-vmm/vm-virtio?rev=01e116c33b1e1ada1afc6734af53316f46fcd1b6#01e116c33b1e1ada1afc6734af53316f46fcd1b6"
+
+[[package]]
+name = "virtio-blk"
+version = "0.1.0"
+source = "git+https://github.com/rust-vmm/vm-virtio?rev=01e116c33b1e1ada1afc6734af53316f46fcd1b6#01e116c33b1e1ada1afc6734af53316f46fcd1b6"
+dependencies = [
+ "log",
+ "virtio-bindings",
+ "virtio-device",
+ "virtio-queue",
+ "vm-memory",
+ "vmm-sys-util",
+]
+
+[[package]]
+name = "virtio-console"
+version = "0.1.0"
+source = "git+https://github.com/rust-vmm/vm-virtio?rev=01e116c33b1e1ada1afc6734af53316f46fcd1b6#01e116c33b1e1ada1afc6734af53316f46fcd1b6"
+dependencies = [
+ "virtio-bindings",
+ "virtio-queue",
+ "vm-memory",
+]
+
+[[package]]
+name = "virtio-device"
+version = "0.1.0"
+source = "git+https://github.com/rust-vmm/vm-virtio?rev=01e116c33b1e1ada1afc6734af53316f46fcd1b6#01e116c33b1e1ada1afc6734af53316f46fcd1b6"
+dependencies = [
+ "log",
+ "virtio-bindings",
+ "virtio-queue",
+ "vm-memory",
+]
 
 [[package]]
 name = "virtio-queue"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07d8406e7250c934462de585d8f2d2781c31819bca1fbb7c5e964ca6bbaabfe8"
+source = "git+https://github.com/rust-vmm/vm-virtio?rev=01e116c33b1e1ada1afc6734af53316f46fcd1b6#01e116c33b1e1ada1afc6734af53316f46fcd1b6"
 dependencies = [
  "log",
  "virtio-bindings",
@@ -642,15 +683,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4b5231d334edbc03b22704caa1a022e4c07491d6df736593f26094df8b04a51"
 
 [[package]]
+name = "vmm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags 2.10.0",
+ "futures",
+ "iced-x86",
+ "libc 1.0.0-alpha.1",
+ "linux-loader",
+ "log",
+ "virtio-bindings",
+ "virtio-blk",
+ "virtio-console",
+ "virtio-device",
+ "virtio-queue",
+ "vm-device",
+ "vm-memory",
+ "vm-superio",
+]
+
+[[package]]
 name = "vmm-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "env_logger",
+ "iced-x86",
+ "libc 0.2.178",
  "log",
- "nvmm",
+ "signal-hook",
  "tokio",
+ "vm-device",
+ "vm-memory",
+ "vmm",
 ]
 
 [[package]]

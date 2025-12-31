@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "nvmm",
+    "vmm",
     "vmm-cli"
 ]
 resolver = "2"

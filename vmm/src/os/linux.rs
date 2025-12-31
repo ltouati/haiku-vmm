@@ -9,17 +9,21 @@ use linux_loader::{
     loader::{KernelLoader, bzimage::BzImage, elf::Elf},
 };
 use log::{debug, error, info};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
-use crate::i8042::I8042Wrapper;
-use crate::lapic::Lapic;
-use crate::pic::Pic;
-use crate::pit::Pit;
-use crate::rtc::RtcWrapper;
-use crate::serial::SerialConsole;
+use crate::devices::i8042::I8042Wrapper;
+use crate::devices::lapic::{self, Lapic};
+use crate::devices::pic::Pic;
+use crate::devices::pit::Pit;
+use crate::devices::rtc::RtcWrapper;
+use crate::devices::serial::SerialConsole;
 
-use crate::virtio::{ConsoleDevice, MmioTransport};
-use crate::{Machine, Vcpu, lapic, regs, sys};
+use crate::devices::virtio_blk::BlockDevice;
+use crate::devices::virtio_console::ConsoleDevice;
+use crate::nvmm::sys;
+use crate::nvmm::vcpu::regs;
+use crate::{Machine, Vcpu, VmAction};
+
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -28,6 +32,9 @@ use vm_device::MutDevicePio;
 use vm_device::bus::{MmioAddress, MmioRange, PioAddress, PioRange};
 use vm_device::device_manager::MmioManager; // Trait for register_mmio
 use vm_device::device_manager::PioManager; // Trait for register_pio
+
+// iced-x86 for robust decoding
+use iced_x86::{Decoder, DecoderOptions};
 
 // CPU / Boot Constants
 const HIMEM_START: u64 = 0x100000;
@@ -42,14 +49,67 @@ pub struct Linux64Guest {
     pub kernel_path: PathBuf,
     pub cmdline: String,
     pub memory_size_mib: u64,
+    pub disk_path: Option<PathBuf>,
+}
+
+// Helper to translate GVA to GPA
+fn translate_gva<M: GuestMemory>(mem: &M, cr3: u64, gva: u64) -> Option<u64> {
+    let pml4_idx = (gva >> 39) & 0x1ff;
+    let pdpt_idx = (gva >> 30) & 0x1ff;
+    let pd_idx = (gva >> 21) & 0x1ff;
+    let pt_idx = (gva >> 12) & 0x1ff;
+    let offset = gva & 0xfff;
+
+    let pml4_base = cr3 & !0xfff;
+    let pml4_entry: u64 = mem.read_obj(GuestAddress(pml4_base + pml4_idx * 8)).ok()?;
+    if pml4_entry & 1 == 0 {
+        return None;
+    }
+
+    let pdpt_base = pml4_entry & 0x000f_ffff_ffff_f000;
+    let pdpt_entry: u64 = mem.read_obj(GuestAddress(pdpt_base + pdpt_idx * 8)).ok()?;
+    if pdpt_entry & 1 == 0 {
+        return None;
+    }
+
+    if pdpt_entry & 0x80 != 0 {
+        let phys = (pdpt_entry & 0x000f_ffff_c000_0000) + (gva & 0x3fff_ffff);
+        return Some(phys);
+    }
+
+    let pd_base = pdpt_entry & 0x000f_ffff_ffff_f000;
+    let pd_entry: u64 = mem.read_obj(GuestAddress(pd_base + pd_idx * 8)).ok()?;
+    if pd_entry & 1 == 0 {
+        return None;
+    }
+
+    if pd_entry & 0x80 != 0 {
+        let phys = (pd_entry & 0x000f_ffff_ffe0_0000) + (gva & 0x1f_ffff);
+        return Some(phys);
+    }
+
+    let pt_base = pd_entry & 0x000f_ffff_ffff_f000;
+    let pt_entry: u64 = mem.read_obj(GuestAddress(pt_base + pt_idx * 8)).ok()?;
+    if pt_entry & 1 == 0 {
+        return None;
+    }
+
+    let phys = (pt_entry & 0x000f_ffff_ffff_f000) + offset;
+    Some(phys)
 }
 
 impl Linux64Guest {
-    pub fn new(kernel_path: PathBuf, cmdline: String, memory_size_mib: u64) -> Self {
+    pub fn new(
+        kernel_path: PathBuf,
+        cmdline: String,
+        memory_size_mib: u64,
+        disk_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             kernel_path,
             cmdline,
             memory_size_mib,
+            disk_path,
         }
     }
 
@@ -58,18 +118,35 @@ impl Linux64Guest {
         machine: &'a mut Machine,
     ) -> anyhow::Result<(GuestMemoryMmap, Vcpu<'a>)> {
         // 1. Setup Memory
+        let guest_mem = self.setup_memory(machine)?;
+
+        // 2. Load Kernel
+        let (entry_point, _is_long_mode) = self.load_kernel(&guest_mem)?;
+
+        // 3. Configure Boot Params
+        self.configure_boot_params(&guest_mem)?;
+
+        // 4. Setup VCPU
+        let vcpu = self.setup_vcpu_state(machine, &guest_mem, entry_point)?;
+
+        Ok((guest_mem, vcpu))
+    }
+
+    fn setup_memory(&self, machine: &mut Machine) -> anyhow::Result<GuestMemoryMmap> {
         let mem_size = self.memory_size_mib * 1024 * 1024;
         let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size as usize)])
             .map_err(|e| io::Error::other(format!("{:?}", e)))?;
         machine.map_guest_memory(&guest_mem)?;
+        Ok(guest_mem)
+    }
 
-        // 2. Load Kernel
+    fn load_kernel(&self, guest_mem: &GuestMemoryMmap) -> anyhow::Result<(u64, bool)> {
         info!("Loading kernel from {:?}", self.kernel_path);
         let mut kernel_file = File::open(&self.kernel_path)?;
 
         // Try ELF
-        let (entry_point, _is_long_mode) = if let Ok(res) = Elf::load(
-            &guest_mem,
+        if let Ok(res) = Elf::load(
+            guest_mem,
             None,
             &mut kernel_file,
             Some(GuestAddress(HIMEM_START)),
@@ -78,11 +155,11 @@ impl Linux64Guest {
                 "Detected ELF Kernel. Entry: 0x{:x}",
                 res.kernel_load.raw_value()
             );
-            (res.kernel_load.raw_value(), true)
+            Ok((res.kernel_load.raw_value(), true))
         } else {
             kernel_file.seek(SeekFrom::Start(0))?;
             let res = BzImage::load(
-                &guest_mem,
+                guest_mem,
                 None,
                 &mut kernel_file,
                 Some(GuestAddress(HIMEM_START)),
@@ -91,17 +168,23 @@ impl Linux64Guest {
                 "Detected BzImage Kernel. Entry: 0x{:x}",
                 res.kernel_load.raw_value()
             );
-            (res.kernel_load.raw_value(), false)
-        };
+            Ok((res.kernel_load.raw_value(), false))
+        }
+    }
 
-        // 3. Configure Boot Params
+    fn configure_boot_params(&self, guest_mem: &GuestMemoryMmap) -> anyhow::Result<()> {
+        let mem_size = self.memory_size_mib * 1024 * 1024;
         let mut params = boot_params::default();
 
         params.hdr.type_of_loader = 0xFF;
         params.hdr.boot_flag = 0xAA55;
         params.hdr.header = 0x5372_6448;
+        let mut cmdline = self.cmdline.clone();
+        if self.disk_path.is_some() {
+            cmdline.push_str(" virtio_mmio.device=512@0xd0002000:5 root=/dev/vda rw");
+        }
         params.hdr.cmd_line_ptr = BOOT_CMD_START as u32;
-        params.hdr.cmdline_size = self.cmdline.len() as u32 + 1;
+        params.hdr.cmdline_size = cmdline.len() as u32 + 1;
         params.hdr.kernel_alignment = 0x01000000; // 16MB Alignment
 
         add_e820_entry(&mut params, 0, 0x9fc00, 1);
@@ -109,15 +192,22 @@ impl Linux64Guest {
 
         LinuxBootConfigurator::write_bootparams(
             &BootParams::new(&params, GuestAddress(ZERO_PAGE_START)),
-            &guest_mem,
+            guest_mem,
         )
         .map_err(|e| io::Error::other(format!("Failed to write boot params: {:?}", e)))?;
 
-        let mut cmdline_bytes = self.cmdline.as_bytes().to_vec();
-        cmdline_bytes.push(0);
+        let mut cmdline_bytes = cmdline.as_bytes().to_vec();
+        cmdline_bytes.push(0); // Null terminator
         guest_mem.write_slice(&cmdline_bytes, GuestAddress(BOOT_CMD_START))?;
+        Ok(())
+    }
 
-        // 4. Setup VCPU
+    fn setup_vcpu_state<'a>(
+        &self,
+        machine: &'a mut Machine,
+        guest_mem: &GuestMemoryMmap,
+        entry_point: u64,
+    ) -> anyhow::Result<Vcpu<'a>> {
         let mut vcpu = machine.create_vcpu(0)?;
 
         // Create TSS (Required for NVMM)
@@ -132,20 +222,18 @@ impl Linux64Guest {
         state.gprs[regs::GPR_RFLAGS] = 0x2;
 
         // Segments (64-bit Long Mode)
-        // CS: Long Mode (G=1, L=1).
-        // Attrib: 0xA09B (G=1, D=0, L=1, P=1).
         let code_seg = sys::NvmmX64StateSeg {
             selector: 0x8,
             base: 0,
             limit: 0xffffffff,
-            attrib: 0x0a9b, // Haiku NVMM: Type(0-3),S(4),DPL(5-6),P(7),AVL(8),L(9),DEF(10),G(11). 0xA = G=1,L=1
+            attrib: 0x0a9b,
         };
 
         let data_seg = sys::NvmmX64StateSeg {
             selector: 0x10,
             base: 0,
             limit: 0xffffffff,
-            attrib: 0x0c93, // G=1, DEF=1 (Big). 0xC = 1100.
+            attrib: 0x0c93,
         };
 
         let tss_seg = sys::NvmmX64StateSeg {
@@ -186,7 +274,7 @@ impl Linux64Guest {
         };
 
         // Setup Page Tables
-        use_long_mode_pagetables(&guest_mem)?;
+        use_long_mode_pagetables(guest_mem)?;
 
         // CR0 PE | PG | ET. (Matches KVM approx, no NE, no CD/NW yet)
         let cr0 = regs::CR0_PE | regs::CR0_PG | regs::CR0_ET;
@@ -211,7 +299,7 @@ impl Linux64Guest {
 
         vcpu.set_state(&state, flags)?;
 
-        Ok((guest_mem, vcpu))
+        Ok(vcpu)
     }
 
     pub async fn run<'a>(
@@ -221,11 +309,7 @@ impl Linux64Guest {
     ) -> anyhow::Result<()> {
         info!("Starting VCPU...");
 
-        // Initialize Devices (Thread-Safe)
-
         // Disable XSAVE (26), OSXSAVE (27), AVX (28), F16C (29) in ECX of Leaf 1
-        // This prevents the kernel from seeing XSAVE support and hitting
-        // the "size 576 != kernel_size 0" panic in paranoid_xstate_size_valid.
         vcpu.configure_cpuid(
             1,
             0,
@@ -242,7 +326,7 @@ impl Linux64Guest {
         let pit = Arc::new(Mutex::new(Pit::new()));
         let serial = Arc::new(Mutex::new(SerialConsole::new()));
         let rtc = Arc::new(Mutex::new(RtcWrapper::new()));
-        let lapic = Arc::new(Mutex::new(Lapic::new())); // Make lapic thread-safe
+        let lapic = Arc::new(Mutex::new(Lapic::new()));
 
         // Initialize PICs
         let master_pic = Arc::new(Mutex::new(Pic::new(true)));
@@ -258,127 +342,129 @@ impl Linux64Guest {
                 .lock()
                 .map_err(|_| anyhow!("Failed to lock device manager"))?;
 
-            // Register Devices
-            // PIT: 0x40-0x43
+            // Capture a clone for the handler
+
+            // Register PIO Devices
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x40), 4)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
                     pit.clone(),
                 )
-                .context("Failed to register PIT")?;
-            // Speaker/Control: 0x61
+                .context("PIT")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x61), 1)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
                     pit.clone(),
                 )
-                .context("Failed to register PIT Speaker")?;
-            // Serial: 0x3F8-0x3FF
+                .context("Speaker")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x3F8), 8)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
                     serial.clone(),
                 )
-                .context("Failed to register Serial")?;
-            // RTC/CMOS: 0x70-0x71
+                .context("Serial")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x70), 2)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
                     rtc.clone(),
                 )
-                .context("Failed to register RTC")?;
-            // Debug Port / DMA Page Registers: 0x80-0x8F
+                .context("RTC")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x80), 0x10)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
                     debug_port,
                 )
-                .context("Failed to register Debug Port")?;
-            // I8042 Data: 0x60
+                .context("DebugPort")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x60), 1)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
                     i8042.clone(),
                 )
-                .context("Failed to register I8042 Data")?;
-            // I8042 Command/Status: 0x64
+                .context("I8042 Data")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x64), 1)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
                     i8042.clone(),
                 )
-                .context("Failed to register I8042 Cmd")?;
-            // Master PIC: 0x20-0x21
+                .context("I8042 Cmd")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x20), 2)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
                     master_pic.clone(),
                 )
-                .context("Failed to register Master PIC")?;
-            // Slave PIC: 0xA0-0xA1
+                .context("Master PIC")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0xA0), 2)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
                     slave_pic.clone(),
                 )
-                .context("Failed to register Slave PIC")?; // Using slave_pic
+                .context("Slave PIC")?;
+
+            let pci_stub = Arc::new(Mutex::new(PciStub));
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0xCF8), 8)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    pci_stub,
+                )
+                .context("PCI Stub")?;
+
+            // Register MMIO Devices
+            // LAPIC: 0xFEE00000 - 0xFEE00FFF
+            device_mgr
+                .register_mmio(
+                    MmioRange::new(MmioAddress(0xFEE00000), 0x1000)
+                        .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
+                    lapic.clone(),
+                )
+                .context("Failed to register LAPIC")?;
+
+            // Initialize VirtIO Console
+            let virtio_console = Arc::new(Mutex::new(ConsoleDevice::new()?));
+            virtio_console
+                .lock()
+                .expect("Poisoned lock")
+                .set_memory(guest_mem.clone());
+            device_mgr
+                .register_mmio(
+                    MmioRange::new(MmioAddress(0xd0000000), 0x200)
+                        .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
+                    virtio_console.clone(),
+                )
+                .context("Failed to register VirtIO Console")?;
+
+            // Initialize VirtIO Block
+            if let Some(disk_path) = &self.disk_path {
+                info!("Initializing VirtIO Block with {:?}", disk_path);
+                let disk_file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(disk_path)
+                    .context("Failed to open disk image")?;
+                let virtio_blk = Arc::new(Mutex::new(BlockDevice::new(disk_file)?));
+                {
+                    let mut blk = virtio_blk.lock().expect("Poisoned lock");
+                    blk.set_memory(guest_mem.clone());
+                    blk.set_injector(vcpu.injector(), 37); // IRQ 5 -> Vector 37 (0x25)
+                }
+                device_mgr
+                    .register_mmio(
+                        MmioRange::new(MmioAddress(0xd0002000), 0x200)
+                            .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
+                        virtio_blk.clone(),
+                    )
+                    .context("Failed to register VirtIO Block")?;
+            }
         }
-        let pci_stub = Arc::new(Mutex::new(PciStub));
-        // PCI Stub: 0xCF8-0xCFF
-        vcpu.machine
-            .device_mgr
-            .lock()
-            .map_err(|_| anyhow!("Failed to lock device manager"))?
-            .register_pio(
-                PioRange::new(PioAddress(0xCF8), 8)
-                    .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
-                pci_stub,
-            )
-            .context("Failed to register PCI Stub")?;
-
-        // Register LAPIC (Fixed Base for now)
-        // 0xFEE00000 - 0xFEE00FFF
-        vcpu.machine
-            .device_mgr
-            .lock()
-            .map_err(|_| anyhow!("Failed to lock device manager"))?
-            .register_mmio(
-                MmioRange::new(MmioAddress(0xFEE00000), 0x1000)
-                    .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
-                lapic.clone(),
-            )
-            .context("Failed to register LAPIC")?;
-
-        // Initialize VirtIO
-        let virtio_console = Arc::new(Mutex::new(MmioTransport::new(Box::new(
-            ConsoleDevice::new(),
-        ))));
-        virtio_console
-            .lock()
-            .map_err(|_| anyhow!("Failed to lock virtio console"))?
-            .set_memory(guest_mem.clone());
-        // VirtIO Console: 0xd0000000 - 0xd00001ff
-        vcpu.machine
-            .device_mgr
-            .lock()
-            .map_err(|_| anyhow!("Failed to lock device manager"))?
-            .register_mmio(
-                MmioRange::new(MmioAddress(0xd0000000), 0x200)
-                    .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
-                virtio_console.clone(),
-            )
-            .context("Failed to register VirtIO Console")?;
-
-        // Lock dropped automatically
 
         // Spawn Timer Thread
         {
@@ -388,14 +474,11 @@ impl Linux64Guest {
 
             thread::spawn(move || {
                 loop {
-                    // Check approximately every 1ms
                     thread::sleep(Duration::from_millis(1));
-
-                    let mut p = pit.lock().unwrap();
+                    let mut p = pit.lock().expect("Poisoned lock");
                     if p.update_irq() > 0 {
-                        let mut m = master_pic.lock().unwrap();
+                        let mut m = master_pic.lock().expect("Poisoned lock");
                         m.set_irq(0, true);
-
                         if let Some(vector) = m.ack_interrupt() {
                             let _ = injector.inject_interrupt(vector);
                         }
@@ -409,56 +492,135 @@ impl Linux64Guest {
             let mut buffer = [0; 1];
             loop {
                 match io::stdin().read(&mut buffer) {
-                    Ok(0) => break, // EOF
+                    Ok(0) => break,
                     Ok(_) => {
-                        serial_in.lock().unwrap().queue_input(&buffer);
-                        // Simple local echo for now since we are not in raw mode
+                        serial_in
+                            .lock()
+                            .expect("Poisoned lock")
+                            .queue_input(&buffer);
+                        // Local echo
                         let _ = io::stdout().write(&buffer);
                         let _ = io::stdout().flush();
                     }
-                    Err(_) => break, // Error
+                    Err(_) => break,
                 }
             }
         });
 
+        // Prepare handlers
         let apic_base = Arc::new(Mutex::new(lapic::APIC_BASE | 0x800)); // Base + Enable bit
         let apic_base_msr = apic_base.clone();
 
+        let guest_mem_handler = guest_mem.clone();
+        let injector_handler = vcpu.injector();
+        let injector_msr = vcpu.injector();
+        // device_mgr is locked inside machine, need to access via clone on demand or before
+        let device_mgr_mem = vcpu.machine.device_mgr.clone();
+
         vcpu.runner()
-            // Removed on_io and on_memory, using defaults from lib.rs
+            // Robust Memory Handler (LAPIC Fix)
+            .on_memory(move |gpa, is_write, inst_len, inst_bytes, value| {
+                let device_mgr = device_mgr_mem.clone();
+                let guest_mem = guest_mem_handler.clone();
+                let injector = injector_handler;
+
+                Box::pin(async move {
+                    let (final_len, reg, size) = if inst_len > 0 {
+                        let inst_slice = &inst_bytes[..inst_len as usize];
+                        let mut decoder = Decoder::with_ip(64, inst_slice, 0, DecoderOptions::NONE);
+                        let instruction = decoder.iter().next();
+                        let size = instruction.map(|i| i.memory_size().size()).unwrap_or(4);
+                        let reg = instruction.and_then(|i| {
+                            if !is_write { Some(regs::reg_to_gpr(i.op0_register())) } else { None }
+                        }).unwrap_or(regs::GPR_RAX);
+                        (inst_len as u64, reg, size)
+                    } else {
+                        // Manual fetch fallback
+                        if let Ok(state) = injector.get_state(sys::NVMM_X64_STATE_ALL) {
+                            let rip = state.gprs[regs::GPR_RIP];
+                            let cr3 = state.crs[2];
+                            let mut code_bytes = [0u8; 15];
+                            let mut fetched = false;
+                            // Simple fetch loop
+                            for (i, byte) in code_bytes.iter_mut().enumerate() {
+                                let gva = rip + i as u64;
+                                if let Some(gpa_fe) = translate_gva(&guest_mem, cr3, gva) {
+                                    if let Ok(b) = guest_mem.read_obj::<u8>(GuestAddress(gpa_fe)) {
+                                        *byte = b;
+                                        fetched = true;
+                                    } else { break; }
+                                } else { break; }
+                            }
+
+                            if fetched {
+                                let mut decoder = Decoder::with_ip(64, &code_bytes, rip, DecoderOptions::NONE);
+                                if let Some(instruction) = decoder.iter().next() {
+                                    let size = instruction.memory_size().size();
+                                    let len = instruction.len() as u64;
+                                    let reg = if !is_write { regs::reg_to_gpr(instruction.op0_register()) } else { regs::GPR_RAX };
+
+                                    if len > 0 {
+                                        debug!("Manually decoded MMIO instr at {:#x}: len={}, reg={}, size={}", rip, len, reg, size);
+                                        (len, reg, size)
+                                    } else { (0, regs::GPR_RAX, 4) }
+                                } else { (0, regs::GPR_RAX, 4) }
+                            } else { (0, regs::GPR_RAX, 4) }
+                        } else { (0, regs::GPR_RAX, 4) }
+                    };
+
+                    if final_len == 0 && inst_len == 0 {
+                        return Err(anyhow!("Failed to decode instruction"));
+                    }
+
+                    if is_write {
+                        let val_bytes = value.to_le_bytes();
+                        device_mgr.lock().expect("Poisoned lock")
+                            .mmio_write(MmioAddress(gpa), &val_bytes[..size])
+                            .map_err(|e| anyhow!("MMIO Write Error at {:#x}: {:?}", gpa, e))?;
+                        Ok(VmAction::AdvanceRip(final_len))
+                    } else {
+                        let mut data = [0u8; 8];
+                        device_mgr.lock().expect("Poisoned lock")
+                            .mmio_read(MmioAddress(gpa), &mut data[..size])
+                            .map_err(|e| anyhow!("MMIO Read Error at {:#x}: {:?}", gpa, e))?;
+
+                        let val = u64::from_le_bytes(data);
+                        Ok(VmAction::WriteRegAndContinue {
+                            reg,
+                            val,
+                            advance_rip: final_len,
+                        })
+                    }
+                })
+            })
+            // Robust MSR Handler (Advance on Unknown)
             .on_msr(move |msr, is_write, val, npc| {
                 let apic_base = apic_base_msr.clone();
+                let injector = injector_msr;
                 Box::pin(async move {
                     if msr == 0x1B {
-                        // APIC_BASE
-                        if is_write {
-                            *apic_base.lock().unwrap() = val;
-                        }
-                        // Write: Just advance RIP. WRMSR provides NPC, so SetRip(npc).
-                        Ok(crate::VmAction::SetRip(npc))
-                    } else if msr == 0x10a {
-                        // ARCH_CAPABILITIES
-                        if !is_write {
-                            // Read: Return 0 via RAX. Ignore RDX.
-                            Ok(crate::VmAction::WriteRegMasked {
-                                reg: regs::GPR_RAX,
-                                val: 0,
-                                mask: 0xFFFFFFFF,
-                                next_rip: npc,
-                            })
-                        } else {
-                            Ok(crate::VmAction::SetRip(npc))
-                        }
+                        if is_write { *apic_base.lock().expect("Poisoned lock") = val; }
+                        return Ok(VmAction::SetRip(npc));
+                    }
+                    debug!("Handling MSR Exit: msr={:#x}", msr);
+                    if !is_write {
+                        // Return 0
+                        let mut state = injector.get_state(sys::NVMM_X64_STATE_GPRS)
+                            .map_err(|e| anyhow!("Failed to get state: {}", e))?;
+                        state.gprs[regs::GPR_RAX] = 0;
+                        state.gprs[regs::GPR_RDX] = 0;
+                        injector.set_state(&state, sys::NVMM_X64_STATE_GPRS)
+                            .map_err(|e| anyhow!("Failed to set state: {}", e))?;
+                        Ok(VmAction::SetRip(npc))
                     } else {
-                        debug!("Unhandled MSR {:#x}", msr);
-                        Ok(crate::VmAction::SetRip(npc)) // Just skip it
+                        Ok(VmAction::SetRip(npc))
                     }
                 })
             })
             .on_unknown(|reason| {
                 Box::pin(async move {
                     error!("Unknown VM Exit Reason: {:#x}", reason);
-                    Ok(crate::VmAction::Shutdown)
+                    Ok(VmAction::Shutdown)
                 })
             })
             .run()
@@ -544,25 +706,21 @@ fn use_long_mode_pagetables(mem: &GuestMemoryMmap) -> anyhow::Result<()> {
 }
 
 struct PciStub;
-
 impl MutDevicePio for PciStub {
     fn pio_read(&mut self, _base: PioAddress, _offset: u16, data: &mut [u8]) {
         if data.len() == 1 {
             data[0] = 0xff;
         }
     }
-
     fn pio_write(&mut self, _base: PioAddress, _offset: u16, _data: &[u8]) {}
 }
 
 struct DebugPort;
-
 impl MutDevicePio for DebugPort {
     fn pio_read(&mut self, _base: PioAddress, _offset: u16, data: &mut [u8]) {
         if data.len() == 1 {
             data[0] = 0;
         }
     }
-
     fn pio_write(&mut self, _base: PioAddress, _offset: u16, _data: &[u8]) {}
 }
