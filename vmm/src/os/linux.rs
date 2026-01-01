@@ -1,4 +1,5 @@
 use anyhow::{Context, anyhow};
+use signal_hook::consts::SIGUSR1;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -19,7 +20,6 @@ use crate::devices::rtc::RtcWrapper;
 use crate::devices::serial::SerialConsole;
 
 use crate::devices::virtio_blk::BlockDevice;
-use crate::devices::virtio_console::ConsoleDevice;
 use crate::nvmm::sys;
 use crate::nvmm::vcpu::regs;
 use crate::{Machine, Vcpu, VmAction};
@@ -113,12 +113,21 @@ impl Linux64Guest {
         }
     }
 
+    pub fn register_signal_handler() {
+        // Register a no-op handler for SIGUSR1 to prevent process termination
+        // when kicking the VCPU.
+        let _ = unsafe { signal_hook::low_level::register(SIGUSR1, || {}) };
+    }
+
     pub fn load<'a>(
         &self,
         machine: &'a mut Machine,
     ) -> anyhow::Result<(GuestMemoryMmap, Vcpu<'a>)> {
         // 1. Setup Memory
         let guest_mem = self.setup_memory(machine)?;
+
+        // Register Signal Handler for VCPU Kick
+        Self::register_signal_handler();
 
         // 2. Load Kernel
         let (entry_point, _is_long_mode) = self.load_kernel(&guest_mem)?;
@@ -181,7 +190,9 @@ impl Linux64Guest {
         params.hdr.header = 0x5372_6448;
         let mut cmdline = self.cmdline.clone();
         if self.disk_path.is_some() {
-            cmdline.push_str(" virtio_mmio.device=512@0xd0002000:5 root=/dev/vda rw");
+            cmdline.push_str(
+                " virtio_mmio.device=512@0xd0002000:5 root=/dev/vda rw console=ttyS0 noapic",
+            );
         }
         params.hdr.cmd_line_ptr = BOOT_CMD_START as u32;
         params.hdr.cmdline_size = cmdline.len() as u32 + 1;
@@ -322,15 +333,15 @@ impl Linux64Guest {
             0,
         )?;
 
-        // Initialize Devices (Thread-Safe)
-        let pit = Arc::new(Mutex::new(Pit::new()));
-        let serial = Arc::new(Mutex::new(SerialConsole::new()));
-        let rtc = Arc::new(Mutex::new(RtcWrapper::new()));
-        let lapic = Arc::new(Mutex::new(Lapic::new()));
-
-        // Initialize PICs
+        // Initialize PICs (Moved up for Serial Dependency)
         let master_pic = Arc::new(Mutex::new(Pic::new(true)));
         let slave_pic = Arc::new(Mutex::new(Pic::new(false)));
+
+        // Initialize Devices (Thread-Safe)
+        let pit = Arc::new(Mutex::new(Pit::new()));
+        let serial = Arc::new(Mutex::new(SerialConsole::new(None)));
+        let rtc = Arc::new(Mutex::new(RtcWrapper::new()));
+        let lapic = Arc::new(Mutex::new(Lapic::new()));
 
         let debug_port = Arc::new(Mutex::new(DebugPort));
         let i8042 = Arc::new(Mutex::new(I8042Wrapper::new()));
@@ -428,20 +439,6 @@ impl Linux64Guest {
                 )
                 .context("Failed to register LAPIC")?;
 
-            // Initialize VirtIO Console
-            let virtio_console = Arc::new(Mutex::new(ConsoleDevice::new()?));
-            virtio_console
-                .lock()
-                .expect("Poisoned lock")
-                .set_memory(guest_mem.clone());
-            device_mgr
-                .register_mmio(
-                    MmioRange::new(MmioAddress(0xd0000000), 0x200)
-                        .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
-                    virtio_console.clone(),
-                )
-                .context("Failed to register VirtIO Console")?;
-
             // Initialize VirtIO Block
             if let Some(disk_path) = &self.disk_path {
                 info!("Initializing VirtIO Block with {:?}", disk_path);
@@ -454,7 +451,7 @@ impl Linux64Guest {
                 {
                     let mut blk = virtio_blk.lock().expect("Poisoned lock");
                     blk.set_memory(guest_mem.clone());
-                    blk.set_injector(vcpu.injector(), 37); // IRQ 5 -> Vector 37 (0x25)
+                    blk.set_injector(vcpu.injector(), master_pic.clone(), 5); // IRQ 5 (Conflict Free)
                 }
                 device_mgr
                     .register_mmio(
@@ -470,17 +467,34 @@ impl Linux64Guest {
         {
             let pit = pit.clone();
             let master_pic = master_pic.clone();
+            let lapic = lapic.clone();
             let mut injector = vcpu.injector();
 
             thread::spawn(move || {
                 loop {
                     thread::sleep(Duration::from_millis(1));
+
+                    // PIT (Legacy) - Always update source state
                     let mut p = pit.lock().expect("Poisoned lock");
                     if p.update_irq() > 0 {
                         let mut m = master_pic.lock().expect("Poisoned lock");
                         m.set_irq(0, true);
+                        m.set_irq(0, false);
+                    }
+
+                    // Injection - Only if interrupts enabled
+                    if let Ok(true) = injector.interrupts_enabled() {
+                        // LAPIC Timer (Local)
+                        if let Some(vector) = lapic.lock().expect("Poisoned lock").check_timer() {
+                            let _ = injector.inject_interrupt(vector);
+                            let _ = injector.stop();
+                        }
+
+                        // Master PIC Injection (External)
+                        let mut m = master_pic.lock().expect("Poisoned lock");
                         if let Some(vector) = m.ack_interrupt() {
                             let _ = injector.inject_interrupt(vector);
+                            let _ = injector.stop();
                         }
                     }
                 }
@@ -525,15 +539,18 @@ impl Linux64Guest {
                 let injector = injector_handler.clone();
 
                 Box::pin(async move {
-                    let (final_len, reg, size) = if inst_len > 0 {
+                    let (final_len, reg, size, fallback_val) = if inst_len > 0 {
                         let inst_slice = &inst_bytes[..inst_len as usize];
                         let mut decoder = Decoder::with_ip(64, inst_slice, 0, DecoderOptions::NONE);
                         let instruction = decoder.iter().next();
+                        if let Some(i) = instruction {
+                             log::debug!("MMIO Instr: {:?} {} (len={})", i.code(), i, i.len());
+                        }
                         let size = instruction.map(|i| i.memory_size().size()).unwrap_or(4);
                         let reg = instruction.and_then(|i| {
                             if !is_write { Some(regs::reg_to_gpr(i.op0_register())) } else { None }
                         }).unwrap_or(regs::GPR_RAX);
-                        (inst_len as u64, reg, size)
+                        (inst_len as u64, reg, size, None)
                     } else {
                         // Manual fetch fallback
                         if let Ok(state) = injector.get_state(sys::NVMM_X64_STATE_ALL) {
@@ -557,15 +574,35 @@ impl Linux64Guest {
                                 if let Some(instruction) = decoder.iter().next() {
                                     let size = instruction.memory_size().size();
                                     let len = instruction.len() as u64;
-                                    let reg = if !is_write { regs::reg_to_gpr(instruction.op0_register()) } else { regs::GPR_RAX };
+                                    let (reg, val) = if !is_write {
+                                        (regs::reg_to_gpr(instruction.op0_register()), None)
+                                    } else {
+                                        // For Write: Op0 is destination (Memory), Op1 is Source (Register or Immediate)
+                                        // But wait, for MOV [mem], reg -> Op0=Mem, Op1=Reg.
+                                        // We need the Register from Op1.
+                                        let op1 = instruction.op1_register();
+                                        if op1 != iced_x86::Register::None {
+                                            let r = regs::reg_to_gpr(op1);
+                                            (r, Some(state.gprs[r]))
+                                        } else {
+                                            // Handle Immediate?
+                                            if instruction.op1_kind() == iced_x86::OpKind::Immediate8 {
+                                                 (regs::GPR_RAX, Some(instruction.immediate8() as u64))
+                                            } else if instruction.op1_kind() == iced_x86::OpKind::Immediate32 {
+                                                 (regs::GPR_RAX, Some(instruction.immediate32() as u64))
+                                            } else {
+                                                 (regs::GPR_RAX, None) // Unknown
+                                            }
+                                        }
+                                    };
 
                                     if len > 0 {
-                                        debug!("Manually decoded MMIO instr at {:#x}: len={}, reg={}, size={}", rip, len, reg, size);
-                                        (len, reg, size)
-                                    } else { (0, regs::GPR_RAX, 4) }
-                                } else { (0, regs::GPR_RAX, 4) }
-                            } else { (0, regs::GPR_RAX, 4) }
-                        } else { (0, regs::GPR_RAX, 4) }
+                                        debug!("Manually decoded MMIO instr at {:#x}: len={}, reg={}, size={}, val={:?}", rip, len, reg, size, val);
+                                        (len, reg, size, val)
+                                    } else { (0, regs::GPR_RAX, 4, None) }
+                                } else { (0, regs::GPR_RAX, 4, None) }
+                            } else { (0, regs::GPR_RAX, 4, None) }
+                        } else { (0, regs::GPR_RAX, 4, None) }
                     };
 
                     if final_len == 0 && inst_len == 0 {
@@ -573,7 +610,8 @@ impl Linux64Guest {
                     }
 
                     if is_write {
-                        let val_bytes = value.to_le_bytes();
+                        let val_to_write = fallback_val.unwrap_or(value);
+                        let val_bytes = val_to_write.to_le_bytes();
                         device_mgr.lock().expect("Poisoned lock")
                             .mmio_write(MmioAddress(gpa), &val_bytes[..size])
                             .map_err(|e| anyhow!("MMIO Write Error at {:#x}: {:?}", gpa, e))?;
@@ -770,7 +808,8 @@ mod tests {
 
     #[test]
     fn test_translate_gva() {
-        let mem: GuestMemoryMmap<()> = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1024 * 1024)]).unwrap();
+        let mem: GuestMemoryMmap<()> =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1024 * 1024)]).unwrap();
 
         // Setup Page Tables for identity mapping 0->0
         // CR3 = 0x1000
@@ -793,7 +832,7 @@ mod tests {
         mem.write_obj(pde, GuestAddress(pd_addr)).unwrap();
 
         // PT Entry 0 points to Page 0
-        let pte = 0x0 | 0x3;
+        let pte = 0x3;
         mem.write_obj(pte, GuestAddress(pt_addr)).unwrap();
 
         // Test Translation

@@ -15,7 +15,7 @@ struct Args {
     /// Kernel command line parameters
     #[arg(
         long,
-        default_value = "console=ttyS0 earlyprintk=serial reboot=k panic=1 pci=off nomodule acpi=off noapic virtio_mmio.device=512@0xd0000000:3 nokaslr"
+        default_value = "console=ttyS0 earlyprintk=serial reboot=k panic=1 pci=off nomodule acpi=off noapic "
     )]
     cmdline: String,
 

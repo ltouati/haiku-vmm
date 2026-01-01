@@ -1,127 +1,59 @@
-use std::collections::VecDeque;
+use crate::devices::pic::Pic;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use vm_device::MutDevicePio;
+use vm_device::bus::{PioAddress, PioAddressOffset};
+use vm_superio::serial::NoEvents;
+use vm_superio::{Serial, Trigger};
 
-pub struct SerialConsole {
-    /// Input buffer for characters received from stdin
-    buffer: Arc<Mutex<VecDeque<u8>>>,
-    /// Interrupt enable register (IER) state - specific bit tracking can be added if needed
-    interrupt_enable: Arc<AtomicBool>,
+/// No-op Trigger for Polled Mode
+struct NoOpTrigger;
+
+impl Trigger for NoOpTrigger {
+    type E = io::Error;
+    fn trigger(&self) -> Result<(), Self::E> {
+        Ok(())
+    }
 }
 
-impl Default for SerialConsole {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Serial Console Wrapper using vm-superio.
+pub struct SerialConsole {
+    device: Serial<NoOpTrigger, NoEvents, Box<dyn Write + Send>>,
 }
 
 impl SerialConsole {
-    pub fn new() -> Self {
+    /// Create a new SerialConsole instance.
+    /// Polled mode (No Interrupts).
+    pub fn new(_pic: Option<Arc<Mutex<Pic>>>) -> Self {
+        // Output to stdout
+        let out = Box::new(io::stdout());
+
         Self {
-            buffer: Arc::new(Mutex::new(VecDeque::new())),
-            interrupt_enable: Arc::new(AtomicBool::new(false)),
+            device: Serial::new(NoOpTrigger, out),
         }
     }
 
-    /// Read from a serial port register
-    /// offset: 0-7, corresponding to 0x3F8 + offset
-    pub fn read(&self, offset: u16) -> u8 {
-        match offset {
-            0 => {
-                // RBR: Receiver Buffer Register (Read Only)
-                // If DLAB=0.
-                // We simplify and assume DLAB=0 for read.
-                if let Ok(mut buf) = self.buffer.lock() {
-                    buf.pop_front().unwrap_or(0)
-                } else {
-                    0
-                }
-            }
-            1 => {
-                // IER: Interrupt Enable Register
-                if self.interrupt_enable.load(Ordering::Relaxed) {
-                    1
-                } else {
-                    0
-                }
-            }
-            2 => {
-                // IIR: Interrupt Identification Register
-                // 0xC1 = FIFO enabled, no interrupt pending
-                0xC1
-            }
-            3 => {
-                // LCR: Line Control Register
-                0x3 // 8 bits, no parity, 1 stop bit
-            }
-            4 => {
-                // MCR: Modem Control Register
-                0
-            }
-            5 => {
-                // LSR: Line Status Register
-                let mut lsr = 0x60; // THRE | TEMT (Transmitter Empty)
-                if let Ok(buf) = self.buffer.lock()
-                    && !buf.is_empty()
-                {
-                    lsr |= 0x1; // DR (Data Ready)
-                }
-                lsr
-            }
-            6 => {
-                // MSR: Modem Status Register
-                0
-            }
-            7 => {
-                // SCR: Scratch Register
-                0
-            }
-            _ => 0,
-        }
-    }
-
-    /// Write to a serial port register
-    pub fn write(&self, offset: u16, val: u8) {
-        match offset {
-            0 => {
-                // THR: Transmitter Holding Register (Write Only)
-                // Output to stdout
-                let _ = io::stdout().write(&[val]);
-                let _ = io::stdout().flush();
-            }
-            1 => {
-                // IER
-                self.interrupt_enable
-                    .store((val & 0x1) != 0, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-    }
-
-    /// Add data to the input buffer (called from stdin thread)
-    pub fn queue_input(&self, data: &[u8]) {
-        if let Ok(mut buf) = self.buffer.lock() {
-            for &b in data {
-                buf.push_back(b);
-            }
+    pub fn queue_input(&mut self, data: &[u8]) {
+        if let Err(e) = self.device.enqueue_raw_bytes(data) {
+            log::error!("Failed to enqueue serial input: {:?}", e);
         }
     }
 }
 
-use vm_device::MutDevicePio;
-use vm_device::bus::PioAddress;
-
 impl MutDevicePio for SerialConsole {
-    fn pio_read(&mut self, _base: PioAddress, offset: u16, data: &mut [u8]) {
-        if data.len() == 1 {
-            data[0] = SerialConsole::read(self, offset);
+    fn pio_read(&mut self, _base: PioAddress, offset: PioAddressOffset, data: &mut [u8]) {
+        if data.len() != 1 {
+            return;
         }
+        data[0] = self.device.read(offset as u8);
     }
 
-    fn pio_write(&mut self, _base: PioAddress, offset: u16, data: &[u8]) {
-        if data.len() == 1 {
-            SerialConsole::write(self, offset, data[0]);
+    fn pio_write(&mut self, _base: PioAddress, offset: PioAddressOffset, data: &[u8]) {
+        if data.len() != 1 {
+            return;
+        }
+        if let Err(e) = self.device.write(offset as u8, data[0]) {
+            log::error!("Serial write error: {:?}", e);
         }
     }
 }
@@ -130,39 +62,16 @@ impl MutDevicePio for SerialConsole {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_serial_input() {
-        let serial = SerialConsole::new();
-        // Initially empty
-        assert_eq!(serial.read(0), 0);
-        assert_eq!(serial.read(5) & 0x01, 0); // LSR DR bit
-
-        serial.queue_input(b"ABC");
-        assert_eq!(serial.read(5) & 0x01, 0x01); // DR bit set
-
-        assert_eq!(serial.read(0), b'A');
-        assert_eq!(serial.read(0), b'B');
-        assert_eq!(serial.read(0), b'C');
-        assert_eq!(serial.read(0), 0);
-        assert_eq!(serial.read(5) & 0x01, 0); // DR bit cleared
-    }
 
     #[test]
-    fn test_serial_ier() {
-        let serial = SerialConsole::new();
-        assert_eq!(serial.read(1), 0);
+    fn test_serial_creation() {
+        // SerialConsole ignores Pic in Polled mode
+        let mut serial = SerialConsole::new(None);
 
-        serial.write(1, 0x01); // Enable ERBFI
-        assert_eq!(serial.read(1), 1);
-
-        serial.write(1, 0x00);
-        assert_eq!(serial.read(1), 0);
-    }
-
-    #[test]
-    fn test_serial_lsr_default() {
-        let serial = SerialConsole::new();
-        // LSR should have THRE and TEMT set (0x60)
-        assert_eq!(serial.read(5) & 0x60, 0x60);
+        // Basic read test (LSR)
+        let mut data = [0u8; 1];
+        serial.pio_read(PioAddress(0), 5, &mut data);
+        // vm-superio default LSR is usually 0x60 (THRE|TEMT)
+        assert_eq!(data[0] & 0x60, 0x60);
     }
 }

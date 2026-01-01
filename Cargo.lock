@@ -765,6 +765,7 @@ dependencies = [
  "libc 1.0.0-alpha.1",
  "linux-loader",
  "log",
+ "signal-hook",
  "tempfile",
  "tokio",
  "virtio-bindings",

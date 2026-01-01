@@ -264,6 +264,7 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
                 VmExit::RdMsr { msr, npc } => (self.msr_handler)(msr, false, 0, npc).await?,
                 VmExit::WrMsr { msr, val, npc } => (self.msr_handler)(msr, true, val, npc).await?,
                 VmExit::Interrupted => return Ok(()),
+                VmExit::Halted => VmAction::Continue,
                 VmExit::Unknown(0) => VmAction::Continue,
                 VmExit::Unknown(reason) => {
                     let rip = self.vcpu.get_rip().unwrap_or(0);
@@ -361,6 +362,7 @@ mod tests {
             _id: 0,
             machine: &mut test_machine,
             raw: Box::new(unsafe { std::mem::zeroed() }),
+            tid: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         // Point exit struct to a local variable (since run() checks it)
         // But wait, Vcpu::run does NOT use a local exit struct if we mock.
@@ -373,9 +375,9 @@ mod tests {
         let mut event_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Event>() });
         let mut state_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64State>() });
 
-        (*vcpu.raw).exit = &mut *exit_struct;
-        (*vcpu.raw).event = &mut *event_struct;
-        (*vcpu.raw).state = &mut *state_struct;
+        vcpu.raw.exit = &mut *exit_struct;
+        vcpu.raw.event = &mut *event_struct;
+        vcpu.raw.state = &mut *state_struct;
 
         // Setup IO Handler Checker
         let io_called = Arc::new(std::sync::Mutex::new(false));
@@ -386,7 +388,7 @@ mod tests {
                 let io_called = io_called_clone.clone();
                 Box::pin(async move {
                     assert_eq!(port, 0x80);
-                    assert_eq!(is_in, false);
+                    assert!(!is_in);
                     *io_called.lock().unwrap() = true;
                     Ok(VmAction::Continue)
                 })
@@ -437,14 +439,15 @@ mod tests {
             _id: 0,
             machine: &mut test_machine,
             raw: Box::new(unsafe { std::mem::zeroed() }),
+            tid: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let mut exit_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Exit>() });
         let mut event_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Event>() });
         let mut state_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64State>() });
 
-        (*vcpu.raw).exit = &mut *exit_struct;
-        (*vcpu.raw).event = &mut *event_struct;
-        (*vcpu.raw).state = &mut *state_struct;
+        vcpu.raw.exit = &mut *exit_struct;
+        vcpu.raw.event = &mut *event_struct;
+        vcpu.raw.state = &mut *state_struct;
 
         let mmio_called = Arc::new(std::sync::Mutex::new(false));
         let mmio_called_clone = mmio_called.clone();
@@ -491,14 +494,15 @@ mod tests {
             _id: 0,
             machine: &mut test_machine,
             raw: Box::new(unsafe { std::mem::zeroed() }),
+            tid: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let mut exit_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Exit>() });
         let mut event_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Event>() });
         let mut state_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64State>() });
 
-        (*vcpu.raw).exit = &mut *exit_struct;
-        (*vcpu.raw).event = &mut *event_struct;
-        (*vcpu.raw).state = &mut *state_struct;
+        vcpu.raw.exit = &mut *exit_struct;
+        vcpu.raw.event = &mut *event_struct;
+        vcpu.raw.state = &mut *state_struct;
 
         let shutdown_called = Arc::new(std::sync::Mutex::new(false));
         let shutdown_called_clone = shutdown_called.clone();

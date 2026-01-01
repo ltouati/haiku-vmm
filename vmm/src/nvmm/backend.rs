@@ -158,9 +158,17 @@ impl HypervisorBackend for NvmmBackend {
 
 #[cfg(test)]
 pub struct MockBackend {
+    #[allow(clippy::type_complexity)]
     pub run_behaviors: std::sync::Mutex<
         std::collections::VecDeque<Box<dyn Fn(&mut sys::NvmmX64Exit) -> i32 + Send + Sync>>,
     >,
+}
+
+#[cfg(test)]
+impl Default for MockBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

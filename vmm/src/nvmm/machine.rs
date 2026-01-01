@@ -33,6 +33,7 @@ impl Machine {
             _id: id,
             machine: self,
             raw: vcpu_box,
+            tid: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 

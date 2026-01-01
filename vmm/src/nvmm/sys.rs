@@ -283,6 +283,7 @@ pub const NVMM_EXIT_IO: u64 = 0x02;
 pub const NVMM_EXIT_SHUTDOWN: u64 = 0x1000;
 pub const NVMM_EXIT_RDMSR: u64 = 0x2000;
 pub const NVMM_EXIT_WRMSR: u64 = 0x2001;
+pub const NVMM_EXIT_HALTED: u64 = 0x1003;
 
 // State flags
 pub const NVMM_X64_STATE_SEGS: u64 = 0x01;

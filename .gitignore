@@ -1,7 +1,0 @@
-target
-.idea
-vmlinux.bin
-*.ext4
-*.log
-*.old
-vmlinux

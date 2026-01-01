@@ -24,6 +24,7 @@ pub enum VmExit {
         npc: u64,
     },
     Interrupted,
+    Halted,
     Shutdown,
     Unknown(u64),
 }

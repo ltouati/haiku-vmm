@@ -69,7 +69,7 @@ mod tests {
         assert_eq!(translate_gva(&mem, cr3, 0), Some(0x5000));
 
         // Test non-present entry
-        mem.write_obj(0x5000u64 | 0, GuestAddress(0xd000)).unwrap();
+        mem.write_obj(0x5000u64, GuestAddress(0xd000)).unwrap();
         assert_eq!(translate_gva(&mem, cr3, 0), None);
 
         // Test huge page (2MB) in PDE

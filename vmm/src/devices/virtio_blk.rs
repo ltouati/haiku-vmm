@@ -3,6 +3,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 
 use virtio_bindings::virtio_blk::*;
+use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
 use virtio_blk::defs::SECTOR_SHIFT;
 use virtio_blk::request::{Request, RequestType};
 use virtio_device::{VirtioConfig, VirtioDeviceActions, VirtioDeviceType, VirtioMmioDevice};
@@ -13,6 +14,8 @@ use vm_device::bus::MmioAddress;
 use vm_memory::{Bytes, GuestMemoryMmap};
 
 use crate::VcpuInjector;
+use crate::devices::pic::Pic;
+use std::sync::{Arc, Mutex};
 
 /// VirtIO Block Device using rust-vmm components.
 pub struct BlockDevice {
@@ -20,7 +23,8 @@ pub struct BlockDevice {
     disk_file: File,
     guest_mem: Option<GuestMemoryMmap>,
     injector: Option<VcpuInjector>,
-    irq_vector: u8,
+    pic: Option<Arc<Mutex<Pic>>>,
+    irq_line: u8,
 }
 
 impl BlockDevice {
@@ -33,21 +37,42 @@ impl BlockDevice {
 
         let metadata = disk_file.metadata()?;
         let disk_size = metadata.len();
-
-        // Device features
-        let device_features = (1u64 << VIRTIO_BLK_F_FLUSH) | (1u64 << 32); // VIRTIO_F_VERSION_1
-
-        // Config space: contains capacity (u64 in sectors)
         let capacity_sectors = disk_size >> SECTOR_SHIFT;
-        let mut config_space = Vec::with_capacity(8);
-        config_space.extend_from_slice(&capacity_sectors.to_le_bytes());
+
+        // Populate Config Space
+        let config = virtio_blk_config {
+            capacity: capacity_sectors.to_le(),
+            seg_max: 1024u32.to_le(),
+            blk_size: 512u32.to_le(),
+            num_queues: 1u16.to_le(),
+            ..Default::default()
+        };
+
+        // Features
+        let mut device_features = 0u64;
+        device_features |= 1 << VIRTIO_BLK_F_FLUSH;
+        device_features |= 1 << VIRTIO_BLK_F_SEG_MAX;
+        device_features |= 1 << VIRTIO_BLK_F_BLK_SIZE;
+        device_features |= 1 << VIRTIO_BLK_F_MQ;
+
+        device_features |= 1 << VIRTIO_F_VERSION_1; // Modern device
+
+        // Serialize config to bytes
+        let config_space = unsafe {
+            std::slice::from_raw_parts(
+                &config as *const _ as *const u8,
+                std::mem::size_of::<virtio_blk_config>(),
+            )
+            .to_vec()
+        };
 
         Ok(Self {
             config: VirtioConfig::new(device_features, queues, config_space),
             disk_file,
             guest_mem: None,
             injector: None,
-            irq_vector: 0,
+            pic: None,
+            irq_line: 0,
         })
     }
 
@@ -55,9 +80,10 @@ impl BlockDevice {
         self.guest_mem = Some(mem);
     }
 
-    pub fn set_injector(&mut self, injector: VcpuInjector, vector: u8) {
+    pub fn set_injector(&mut self, injector: VcpuInjector, pic: Arc<Mutex<Pic>>, line: u8) {
         self.injector = Some(injector);
-        self.irq_vector = vector;
+        self.pic = Some(pic);
+        self.irq_line = line;
     }
 }
 
@@ -121,8 +147,6 @@ impl VirtioMmioDevice for BlockDevice {
                     }
                 };
 
-                // Process Request:
-                // Process Request:
                 let used_len = Self::process_request(&mut self.disk_file, &request, &mut chain);
 
                 if queue.add_used(mem, chain.head_index(), used_len).is_ok() {
@@ -132,8 +156,19 @@ impl VirtioMmioDevice for BlockDevice {
         }
 
         if needs_interrupt && let Some(injector) = &mut self.injector {
-            injector.inject_interrupt(self.irq_vector).ok();
-            log::debug!("Injected IRQ {}", self.irq_vector);
+            self.config
+                .interrupt_status
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+
+            // Route through PIC
+            if let Some(pic) = &self.pic {
+                let mut p = pic.lock().unwrap();
+                p.set_irq(self.irq_line, true);
+                if let Some(vector) = p.ack_interrupt() {
+                    injector.inject_interrupt(vector).ok();
+                    log::debug!("Injected Vector {} (IRQ {})", vector, self.irq_line);
+                }
+            }
         }
     }
 }
@@ -141,10 +176,53 @@ impl VirtioMmioDevice for BlockDevice {
 impl MutDeviceMmio for BlockDevice {
     fn mmio_read(&mut self, _base: MmioAddress, offset: u64, data: &mut [u8]) {
         self.read(offset, data);
+
+        // VIRTIO_MMIO_INTERRUPT_STATUS = 0x60
+        // Reading this register returns the interrupt status and clears it.
+        if offset == 0x60 {
+            // Clear the status
+            self.config
+                .interrupt_status
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            // De-assert the interrupt line on the PIC
+            if let Some(pic) = &self.pic {
+                pic.lock().unwrap().set_irq(self.irq_line, false);
+            }
+            log::error!(
+                "VirtIO Blk ISR Read (Cleared). IRQ Line {} De-asserted.",
+                self.irq_line
+            );
+            log::debug!("VirtIO Blk ISR Read (Cleared). Data: {:?}", data);
+        }
+
+        log::debug!(
+            "VirtIO Blk MMIO Read: Offset {:#x}, Data {:?}, Len {}",
+            offset,
+            data,
+            data.len()
+        );
+        if offset == 0x04 && data.len() >= 4 {
+            let version = u32::from_le_bytes(data[0..4].try_into().unwrap());
+            log::debug!("VirtIO Blk Version Read: {}", version);
+        }
     }
 
     fn mmio_write(&mut self, _base: MmioAddress, offset: u64, data: &[u8]) {
+        log::info!(
+            "VirtIO Blk MMIO Write: Offset {:#x}, Data {:?}, Len {}",
+            offset,
+            data,
+            data.len()
+        );
+        // Check legacy status access if possible, or just observe effects
         self.write(offset, data);
+        if offset == 0x70 {
+            // Status
+            log::info!(
+                "VirtIO Blk Status Write. New Status (from config): {:#x}",
+                self.config.device_status
+            );
+        }
     }
 }
 

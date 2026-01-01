@@ -13,7 +13,10 @@ use anyhow::{Result, anyhow};
 use iced_x86::{Decoder, DecoderOptions, OpKind};
 use log::debug;
 use std::io;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use vm_memory::{Bytes, GuestAddress, GuestMemory};
 
 /// A Virtual CPU.
@@ -21,6 +24,7 @@ pub struct Vcpu<'a> {
     pub(crate) _id: u32,
     pub machine: &'a mut Machine,
     pub(crate) raw: Box<sys::NvmmVcpu>,
+    pub(crate) tid: Arc<AtomicUsize>,
 }
 
 impl<'a> Vcpu<'a> {
@@ -128,12 +132,17 @@ impl<'a> Vcpu<'a> {
             machine: mach_ptr,
             vcpu: vcpu_ptr,
             backend: self.machine.backend.clone(),
+            tid: self.tid.clone(),
         }
     }
 
     /// Internal function to run the CPU once.
     pub fn run(&mut self) -> Result<VmExit> {
         unsafe {
+            // Update TID storage
+            self.tid
+                .store(libc::pthread_self() as usize, Ordering::Relaxed);
+
             let ret = self
                 .machine
                 .backend
@@ -261,6 +270,7 @@ impl<'a> Vcpu<'a> {
                     }
                 }
                 sys::NVMM_EXIT_SHUTDOWN => VmExit::Shutdown,
+                sys::NVMM_EXIT_HALTED => VmExit::Halted,
                 0xffffffffffffffff => {
                     let hw = exit.u.inv.hwcode;
                     debug!("NVMM_EXIT_INVALID: hwcode={:#x}", hw);
@@ -294,6 +304,7 @@ pub struct VcpuInjector {
     machine: *mut sys::NvmmMachine,
     vcpu: *mut sys::NvmmVcpu,
     backend: Arc<dyn crate::nvmm::backend::HypervisorBackend>,
+    tid: Arc<AtomicUsize>,
 }
 
 unsafe impl Send for VcpuInjector {}
@@ -320,6 +331,26 @@ impl VcpuInjector {
             }
         }
         Ok(())
+    }
+
+    /// Stop the VCPU (kick).
+    pub fn stop(&self) -> Result<()> {
+        let tid_val = self.tid.load(Ordering::Relaxed);
+        if tid_val != 0 {
+            unsafe {
+                // Send SIGUSR1 to kick the VCPU thread out of KVM_RUN/ioctl (NVMM equivalent)
+                // libc::pthread_kill returns 0 on success.
+                libc::pthread_kill(tid_val as libc::pthread_t, libc::SIGUSR1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if Interrupts are enabled (RFLAGS.IF = 1).
+    pub fn interrupts_enabled(&self) -> Result<bool> {
+        let state = self.get_state(regs::STATE_GPRS)?;
+        let rflags = state.gprs[regs::GPR_RFLAGS];
+        Ok((rflags & 0x200) != 0)
     }
 
     /// Dump the VCPU state (to log/syslog).
@@ -483,7 +514,7 @@ mod tests {
                 port, is_in, data, ..
             } => {
                 assert_eq!(port, 0x3f8);
-                assert_eq!(is_in, false);
+                assert!(!is_in);
                 assert_eq!(data, vec![0x41]);
             }
             _ => panic!("Expected Io exit"),
@@ -514,7 +545,7 @@ mod tests {
         match vm_exit {
             VmExit::Io { port, is_in, .. } => {
                 assert_eq!(port, 0x60);
-                assert_eq!(is_in, true);
+                assert!(is_in);
             }
             _ => panic!("Expected Io exit"),
         }
@@ -540,7 +571,7 @@ mod tests {
         match vm_exit {
             VmExit::Memory { gpa, is_write, .. } => {
                 assert_eq!(gpa, 0x2000);
-                assert_eq!(is_write, false);
+                assert!(!is_write);
             }
             _ => panic!("Expected Memory exit"),
         }
@@ -576,7 +607,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(gpa, 0x1000);
-                assert_eq!(is_write, true);
+                assert!(is_write);
                 assert_eq!(value, 0x55);
             }
             _ => panic!("Expected Memory exit"),
@@ -742,6 +773,7 @@ mod tests {
             _id: 0,
             machine: &mut test_machine,
             raw: Box::new(unsafe { std::mem::zeroed() }),
+            tid: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
         // Prepare Exit Struct
@@ -771,8 +803,8 @@ mod tests {
         // Link raw pointers to our stack allocated structs
         // SAFETY: vcpu.raw is Boxed, so it's stable. exit_struct and event_struct must outlive vcpu.run() call.
         // Accessing/assigning to fields of NvmmVcpu is safe.
-        (*vcpu.raw).exit = &mut exit_struct;
-        (*vcpu.raw).event = &mut event_struct;
+        vcpu.raw.exit = &mut exit_struct;
+        vcpu.raw.event = &mut event_struct;
 
         // Run
         let exit = vcpu.run().unwrap();
@@ -802,6 +834,7 @@ mod tests {
             _id: 0,
             machine: &mut test_machine,
             raw: Box::new(unsafe { std::mem::zeroed() }),
+            tid: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
         let mut event_struct = sys::NvmmX64Event {
@@ -810,7 +843,7 @@ mod tests {
             u: unsafe { std::mem::zeroed() },
         };
 
-        (*vcpu.raw).event = &mut event_struct;
+        vcpu.raw.event = &mut event_struct;
 
         let result = vcpu.inject_interrupt(0x20);
         assert!(result.is_ok());

@@ -464,6 +464,6 @@ mod tests {
 
         let status = pit.read(0x40);
         // Default mode is 3, RW 3. Output should be whatever it is.
-        assert_eq!(status & 0x7F, (3 << 4) | (3 << 1) | 0);
+        assert_eq!(status & 0x7F, (3 << 4) | (3 << 1));
     }
 }

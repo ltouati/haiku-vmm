@@ -26,8 +26,12 @@ pub struct Pic {
 
     // Read Select
     read_isr: bool,
-    // Reference to other PIC? No, typically handled by bus logic
-    // We just expose input lines and output
+
+    // Track input levels for edge detection
+    last_irq_levels: u8,
+    // Edge/Level Control (Simplified: 1=Level, 0=Edge)
+    // We default IRQ 5 to Level (PCI behavior for virtio), others Edge.
+    elcr: u8,
 }
 
 impl Pic {
@@ -35,12 +39,15 @@ impl Pic {
         Self {
             irr: 0,
             isr: 0,
-            imr: 0, // All allowed initially? Or masked? Usually 0.
-            vector_offset: if is_master { 0x8 } else { 0x70 }, // Defaults
+            imr: 0,
+            vector_offset: if is_master { 0x8 } else { 0x70 },
             _is_master: is_master,
             state: State::Ready,
             init_target: false,
             read_isr: false,
+            last_irq_levels: 0,
+            // Hardcode IRQ 5 as Level (0x20), others Edge (0) for simplest stability
+            elcr: 0x20,
         }
     }
 
@@ -49,10 +56,29 @@ impl Pic {
             return;
         }
         let mask = 1 << irq;
+        let last_level = (self.last_irq_levels & mask) != 0;
+
+        // Update Level Cache
         if level {
-            self.irr |= mask;
+            self.last_irq_levels |= mask;
         } else {
-            self.irr &= !mask;
+            self.last_irq_levels &= !mask;
+        }
+
+        let is_level_triggered = (self.elcr & mask) != 0;
+
+        if is_level_triggered {
+            // Level Triggered: IRR follows Input Level
+            if level {
+                self.irr |= mask;
+            } else {
+                self.irr &= !mask;
+            }
+        } else {
+            // Edge Triggered: Set IRR on Rising Edge (0 -> 1)
+            if level && !last_level {
+                self.irr |= mask;
+            }
         }
     }
 
@@ -69,15 +95,13 @@ impl Pic {
 
         // Find LSB
         for i in 0..8 {
-            if (masked_irr & (1 << i)) != 0 {
-                // Check if higher priority is in service?
-                // For simplicity, we assume fully nested mode:
-                // Any IRQ can interrupt distinct lower priority, but here we just check if *any* is serving?
-                // Actually 8259A prevents *same or lower* priority from interrupting.
-                // We simplify: If ISR is 0, we can interrupt.
-                // If ISR is NOT 0, we can only interrupt if priority > current isr?
-                // Let's implement full priority later.
-                // For Linux boot, simplest behavior: return first found.
+            let mask = 1 << i;
+            if (masked_irr & mask) != 0 {
+                // Ignore if already in service (ISR set)
+                // This prevents recursive interrupts for the same line
+                if (self.isr & mask) != 0 {
+                    continue;
+                }
                 return Some(self.vector_offset + i);
             }
         }
@@ -94,11 +118,13 @@ impl Pic {
         for i in 0..8 {
             let mask = 1 << i;
             if (masked_irr & mask) != 0 {
+                // Ignore if already in service (ISR set)
+                // This prevents recursive interrupts for the same line
+                if (self.isr & mask) != 0 {
+                    continue;
+                }
+
                 // Found it.
-                // Note: Usually IRR cleared if edge triggered, kept if level.
-                // We assume Edge for now for simplicity or handle logic outside.
-                // If PIT is edge, we should clear IRR bit here?
-                // Or caller clears?
                 // 8259 spec: IRR bit is reset when interrupt is acknowledged (INTA sequence).
                 self.irr &= !mask;
                 self.isr |= mask;
