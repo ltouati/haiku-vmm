@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
 use std::path::PathBuf;
 
+use byte_unit::Byte;
 use linux_loader::{
     bootparam::boot_params,
     configurator::{BootConfigurator, BootParams, linux::LinuxBootConfigurator},
@@ -25,6 +26,7 @@ use crate::nvmm::vcpu::regs;
 use crate::{Machine, Vcpu, VmAction};
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -46,8 +48,8 @@ const TSS_START: u64 = 0x600;
 const _PAGE_TABLE_START: u64 = 0xa000;
 
 // VirtIO Block Defaults
-const VIRTIO_BLK_ADDR: u64 = 0xd0002000;
-const VIRTIO_BLK_SIZE: u64 = 0x200;
+const VIRTIO_BLK_ADDR: u64 = 0xd0000000;
+const VIRTIO_BLK_SIZE: u64 = 0x1000;
 const VIRTIO_BLK_IRQ: u32 = 5;
 
 #[derive(Clone)]
@@ -216,9 +218,15 @@ impl Linux64Guest {
 
         // 1. Dynamic VirtIO MMIO Arguments
         for dev in &self.mmio_devices {
+            let byte = Byte::from_bytes(dev.size as u128);
+            let adj_byte = byte.get_appropriate_unit(true); // true for Binary (1024 base)
+            let s = adj_byte.format(0); // 0 decimal places
+            // "4 KiB" -> "4K", "1 MiB" -> "1M"
+            let size_str = s.replace("iB", "").replace("B", "").replace(" ", "");
+
             let arg = format!(
                 " virtio_mmio.device={}@0x{:x}:{}",
-                dev.size, dev.base, dev.irq
+                size_str, dev.base, dev.irq
             );
             cmdline.push_str(&arg);
         }
@@ -409,7 +417,8 @@ impl Linux64Guest {
         let lapic = Arc::new(Mutex::new(Lapic::new()));
 
         let debug_port = Arc::new(Mutex::new(DebugPort));
-        let i8042 = Arc::new(Mutex::new(I8042Wrapper::new()));
+        let reset_evt = Arc::new(AtomicBool::new(false));
+        let i8042 = Arc::new(Mutex::new(I8042Wrapper::new(reset_evt.clone())));
 
         {
             let mut device_mgr = vcpu
@@ -595,8 +604,75 @@ impl Linux64Guest {
         let injector_msr = vcpu.injector();
         // device_mgr is locked inside machine, need to access via clone on demand or before
         let device_mgr_mem = vcpu.machine.device_mgr.clone();
+        let device_mgr_io = vcpu.machine.device_mgr.clone();
+        let reset_evt_clone = reset_evt.clone();
 
         vcpu.runner()
+            .on_io(move |port, is_in, data, op_size, npc| {
+                let device_mgr = device_mgr_io.clone();
+                let data = data.to_vec();
+                let reset_evt = reset_evt_clone.clone();
+                Box::pin(async move {
+                    // Check Reset First? No, usually after IO or during.
+                    // But here the IO *causes* the reset.
+
+                    if !is_in {
+                        // Write
+                        device_mgr
+                            .lock()
+                            .map_err(|_| anyhow!("Failed to lock device manager"))?
+                            .pio_write(vm_device::bus::PioAddress(port), &data)
+                            .map_err(|e| {
+                                anyhow!(
+                                    "PIO Write Error: port={:#x}, data={:?}, error={:?}",
+                                    port,
+                                    data,
+                                    e
+                                )
+                            })?;
+                        // CHECK RESET SIGNAL
+                        if reset_evt.load(Ordering::SeqCst) {
+                            info!("Reset Signal Detected!");
+                            return Ok(VmAction::Shutdown);
+                        }
+
+                        Ok(VmAction::SetRip(npc))
+                    } else {
+                        // Read
+                        let mut read_data = vec![0u8; op_size as usize];
+                        device_mgr
+                            .lock()
+                            .map_err(|_| anyhow!("Failed to lock device manager"))?
+                            .pio_read(vm_device::bus::PioAddress(port), &mut read_data)
+                            .map_err(|e| {
+                                anyhow!(
+                                    "PIO Read Error: port={:#x}, size={}, error={:?}",
+                                    port,
+                                    op_size,
+                                    e
+                                )
+                            })?;
+
+                        let mut val = 0u64;
+                        for (i, byte) in read_data.iter().enumerate() {
+                            val |= (*byte as u64) << (i * 8);
+                        }
+
+                        let mask = if op_size >= 8 {
+                            0xffff_ffff_ffff_ffff
+                        } else {
+                            (1u64 << (op_size * 8)) - 1
+                        };
+
+                        Ok(VmAction::WriteRegMasked {
+                            reg: regs::GPR_RAX,
+                            val,
+                            mask,
+                            next_rip: npc,
+                        })
+                    }
+                })
+            })
             // Robust Memory Handler (LAPIC Fix)
             .on_memory(move |gpa, is_write, inst_len, inst_bytes, value| {
                 let device_mgr = device_mgr_mem.clone();
