@@ -58,9 +58,10 @@ async fn main() -> anyhow::Result<()> {
         for _ in signals.forever() {
             println!("\nReceived SIGHUP, dumping VCPU state & Stack Trace...");
             // Use ./vmlinux for addr2line as hardcoded previously, or could derive from args if suitable
-            if let Err(e) = injector
-                .dump_debug_state(&guest_mem_thread, Some(std::path::Path::new("../../kernels/vmlinux")))
-            {
+            if let Err(e) = injector.dump_debug_state(
+                &guest_mem_thread,
+                Some(std::path::Path::new("../../kernels/vmlinux")),
+            ) {
                 eprintln!("Failed to dump debug state: {}", e);
             }
         }

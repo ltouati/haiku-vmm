@@ -45,11 +45,24 @@ const BOOT_GDT_OFFSET: u64 = 0x1000;
 const TSS_START: u64 = 0x600;
 const _PAGE_TABLE_START: u64 = 0xa000;
 
+// VirtIO Block Defaults
+const VIRTIO_BLK_ADDR: u64 = 0xd0002000;
+const VIRTIO_BLK_SIZE: u64 = 0x200;
+const VIRTIO_BLK_IRQ: u32 = 5;
+
+#[derive(Clone)]
+struct VirtioMmioConfig {
+    base: u64,
+    size: u64,
+    irq: u32,
+}
+
 pub struct Linux64Guest {
     pub kernel_path: PathBuf,
     pub cmdline: String,
     pub memory_size_mib: u64,
     pub disk_path: Option<PathBuf>,
+    mmio_devices: Vec<VirtioMmioConfig>,
 }
 
 // Helper to translate GVA to GPA
@@ -105,11 +118,22 @@ impl Linux64Guest {
         memory_size_mib: u64,
         disk_path: Option<PathBuf>,
     ) -> Self {
+        let mut mmio_devices = Vec::new();
+
+        if disk_path.is_some() {
+            mmio_devices.push(VirtioMmioConfig {
+                base: VIRTIO_BLK_ADDR,
+                size: VIRTIO_BLK_SIZE,
+                irq: VIRTIO_BLK_IRQ,
+            });
+        }
+
         Self {
             kernel_path,
             cmdline,
             memory_size_mib,
             disk_path,
+            mmio_devices,
         }
     }
 
@@ -189,13 +213,19 @@ impl Linux64Guest {
         params.hdr.boot_flag = 0xAA55;
         params.hdr.header = 0x5372_6448;
         let mut cmdline = self.cmdline.clone();
+
+        // 1. Dynamic VirtIO MMIO Arguments
+        for dev in &self.mmio_devices {
+            let arg = format!(
+                " virtio_mmio.device={}@0x{:x}:{}",
+                dev.size, dev.base, dev.irq
+            );
+            cmdline.push_str(&arg);
+        }
+
+        // 2. Other Required Flags
         if self.disk_path.is_some() {
-            let required_flags = [
-                "virtio_mmio.device=512@0xd0002000:5",
-                "root=/dev/vda",
-                "rw",
-                "console=ttyS0",
-            ];
+            let required_flags = ["root=/dev/vda", "rw", "console=ttyS0"];
             for flag in required_flags {
                 if !cmdline.contains(flag) {
                     if !cmdline.is_empty() && !cmdline.ends_with(' ') {
@@ -486,11 +516,11 @@ impl Linux64Guest {
                 {
                     let mut blk = virtio_blk.lock().expect("Poisoned lock");
                     blk.set_memory(guest_mem.clone());
-                    blk.set_injector(vcpu.injector(), master_pic.clone(), 5); // IRQ 5 (Conflict Free)
+                    blk.set_injector(vcpu.injector(), master_pic.clone(), VIRTIO_BLK_IRQ as u8); // IRQ 5 (Conflict Free)
                 }
                 device_mgr
                     .register_mmio(
-                        MmioRange::new(MmioAddress(0xd0002000), 0x200)
+                        MmioRange::new(MmioAddress(VIRTIO_BLK_ADDR), VIRTIO_BLK_SIZE)
                             .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
                         virtio_blk.clone(),
                     )
