@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
             println!("\nReceived SIGHUP, dumping VCPU state & Stack Trace...");
             // Use ./vmlinux for addr2line as hardcoded previously, or could derive from args if suitable
             if let Err(e) = injector
-                .dump_debug_state(&guest_mem_thread, Some(std::path::Path::new("./vmlinux")))
+                .dump_debug_state(&guest_mem_thread, Some(std::path::Path::new("../../kernels/vmlinux")))
             {
                 eprintln!("Failed to dump debug state: {}", e);
             }
@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     println!("SIGHUP handler registered. PID: {}", std::process::id());
 
     // START THE GUEST
+    println!("VMM-CLI: Calling guest.run()...");
     if let Err(e) = guest.run(&mut vcpu, &guest_mem).await {
         error!("Guest exited with error: {}", e);
     }

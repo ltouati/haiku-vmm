@@ -190,9 +190,20 @@ impl Linux64Guest {
         params.hdr.header = 0x5372_6448;
         let mut cmdline = self.cmdline.clone();
         if self.disk_path.is_some() {
-            cmdline.push_str(
-                " virtio_mmio.device=512@0xd0002000:5 root=/dev/vda rw console=ttyS0 noapic",
-            );
+            let required_flags = [
+                "virtio_mmio.device=512@0xd0002000:5",
+                "root=/dev/vda",
+                "rw",
+                "console=ttyS0",
+            ];
+            for flag in required_flags {
+                if !cmdline.contains(flag) {
+                    if !cmdline.is_empty() && !cmdline.ends_with(' ') {
+                        cmdline.push(' ');
+                    }
+                    cmdline.push_str(flag);
+                }
+            }
         }
         params.hdr.cmd_line_ptr = BOOT_CMD_START as u32;
         params.hdr.cmdline_size = cmdline.len() as u32 + 1;
@@ -333,13 +344,37 @@ impl Linux64Guest {
             0,
         )?;
 
+        // Advertise KVM Signature
+        // Leaf 0x40000000:
+        // EAX: MAXIMUM LEAF (0x40000001)
+        // EBX: "KVMK", ECX: "VMKV", EDX: "M\0\0\0"
+        // Wait, standard KVM signature is:
+        // EBX: 0x4b4d564b ("KVMK"), ECX: 0x564b4d56 ("VMKV"), EDX: 0x4d ("M")
+        // Correct order for "KVMKVMKVM\0\0\0"
+        vcpu.configure_cpuid(
+            0x4000_0000,
+            0x4000_0001,
+            0x4b4d_564b,
+            0x564b_4d56,
+            0x0000_004d,
+            0,
+            0,
+            0,
+            0,
+        )?;
+
+        // Advertise KVM Features (Clocksource)
+        // Leaf 0x40000001:
+        // EAX: bit 0 (KVM_FEATURE_CLOCKSOURCE), bit 3 (KVM_FEATURE_CLOCKSOURCE2)
+        vcpu.configure_cpuid(0x4000_0001, 0x1 | 0x8, 0, 0, 0, 0, 0, 0, 0)?;
+
         // Initialize PICs (Moved up for Serial Dependency)
         let master_pic = Arc::new(Mutex::new(Pic::new(true)));
         let slave_pic = Arc::new(Mutex::new(Pic::new(false)));
 
         // Initialize Devices (Thread-Safe)
         let pit = Arc::new(Mutex::new(Pit::new()));
-        let serial = Arc::new(Mutex::new(SerialConsole::new(None)));
+        let serial = Arc::new(Mutex::new(SerialConsole::new(Some(master_pic.clone()))));
         let rtc = Arc::new(Mutex::new(RtcWrapper::new()));
         let lapic = Arc::new(Mutex::new(Lapic::new()));
 
@@ -640,7 +675,37 @@ impl Linux64Guest {
                         if is_write { *apic_base.lock().expect("Poisoned lock") = val; }
                         return Ok(VmAction::SetRip(npc));
                     }
-                    debug!("Handling MSR Exit: msr={:#x}", msr);
+
+                    // KVM Clock MSRs
+                    if msr == 0x11 || msr == 0x12 || msr == 0x4b564d00 || msr == 0x4b564d01 {
+                        debug!("KVM Clock MSR Access: msr={:#x}, is_write={}, val={:#x}", msr, is_write, val);
+                        // For now, return 0 on read and ignore write.
+                        // Real implementation would track GPA and update wallclock/system time.
+                        if !is_write {
+                            let mut state = injector.get_state(sys::NVMM_X64_STATE_GPRS)
+                                .map_err(|e| anyhow!("Failed to get state: {}", e))?;
+                            state.gprs[regs::GPR_RAX] = 0;
+                            state.gprs[regs::GPR_RDX] = 0;
+                            injector.set_state(&state, sys::NVMM_X64_STATE_GPRS)
+                                .map_err(|e| anyhow!("Failed to set state: {}", e))?;
+                        }
+                        return Ok(VmAction::SetRip(npc));
+                    }
+
+                    // IA32_ARCH_CAPABILITIES
+                    if msr == 0x10a {
+                         if !is_write {
+                            let mut state = injector.get_state(sys::NVMM_X64_STATE_GPRS)
+                                .map_err(|e| anyhow!("Failed to get state: {}", e))?;
+                            state.gprs[regs::GPR_RAX] = 0; // No special capabilities
+                            state.gprs[regs::GPR_RDX] = 0;
+                            injector.set_state(&state, sys::NVMM_X64_STATE_GPRS)
+                                .map_err(|e| anyhow!("Failed to set state: {}", e))?;
+                         }
+                         return Ok(VmAction::SetRip(npc));
+                    }
+
+                    debug!("Handling MSR Exit: msr={:#x}, is_write={}, val={:#x}", msr, is_write, val);
                     if !is_write {
                         // Return 0
                         let mut state = injector.get_state(sys::NVMM_X64_STATE_GPRS)

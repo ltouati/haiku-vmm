@@ -1,4 +1,4 @@
-use log::info;
+use log::debug;
 use vm_device::MutDevicePio;
 use vm_device::bus::PioAddress;
 use vm_superio::I8042Device;
@@ -22,7 +22,7 @@ impl Trigger for LogTrigger {
     type E = ();
 
     fn trigger(&self) -> Result<(), Self::E> {
-        info!("Trigger fired: {}", self.name);
+        debug!("Trigger fired: {}", self.name);
         Ok(())
     }
 }
@@ -33,10 +33,17 @@ pub struct I8042Wrapper {
 
 impl I8042Wrapper {
     pub fn new() -> Self {
+        debug!("Initializing I8042 device");
         let trigger = LogTrigger::new("I8042 Reset");
-        I8042Wrapper {
-            device: I8042Device::new(trigger),
-        }
+        let mut device = I8042Device::new(trigger);
+        // Bit 2 of Controller Command Byte (CTR) / Status is "System Flag".
+        // Setting it to 1 indicates POST completion, which many kernels expect.
+        // vm-superio I8042Device: offset 0 is Data, offset 4 is Command/Status.
+        debug!("I8042: Sending Write-CTR command (0x60) to command port (0x64)");
+        let _ = device.write(4, 0x60); // Command: Write CTR
+        debug!("I8042: Writing 0x05 to data port (0x60) to enable and set SysFlag");
+        let _ = device.write(0, 0x05); // Value: Bit 2 (Sys flag) = 1, Bit 0 (En) = 1
+        I8042Wrapper { device }
     }
 }
 
@@ -49,28 +56,17 @@ impl Default for I8042Wrapper {
 impl MutDevicePio for I8042Wrapper {
     fn pio_read(&mut self, base: PioAddress, _offset: u16, data: &mut [u8]) {
         if data.len() == 1 {
-            // I8042Device expects offset 0 for Data (0x60) and 4 for Cmd (0x64) usually?
-            // Wait, vm-superio I8042Device typically handles offsets relative to its base?
-            // But we register it at two discontiguous ranges: 0x60 and 0x64.
-            // My IoManager dispatch sends offset relative to Base.
-            // If registered at 0x60 len 1 -> offset 0.
-            // If registered at 0x64 len 1 -> offset 0.
-            // But I8042Device might expect 0 and 4?
-            // Docs for vm-superio 0.5.0:
-            // "The I8042 device... It handles reads and writes at offsets 0 (DATA) and 4 (COMMAND/STATUS)."
-            // So if I map 0x60->0 and 0x64->4, I need to adjust offset.
-
-            // If base is 0x60, offset 0 -> device offset 0.
-            // If base is 0x64, offset 0 -> device offset 4.
-
             let internal_offset = if base.0 == 0x60 { 0 } else { 4 };
-            data[0] = self.device.read(internal_offset);
+            let val = self.device.read(internal_offset);
+            debug!("DEBUG: I8042 Read Port {:#x} -> {:#x}", base.0, val);
+            data[0] = val;
         }
     }
 
     fn pio_write(&mut self, base: PioAddress, _offset: u16, data: &[u8]) {
         if data.len() == 1 {
             let internal_offset = if base.0 == 0x60 { 0 } else { 4 };
+            debug!("DEBUG: I8042 Write Port {:#x} <- {:#x}", base.0, data[0]);
             let _ = self.device.write(internal_offset, data[0]);
         }
     }

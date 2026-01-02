@@ -16,20 +16,68 @@ impl Trigger for NoOpTrigger {
     }
 }
 
+/// Trigger that signals a PIC IRQ.
+struct PicTrigger {
+    pic: Arc<Mutex<Pic>>,
+    irq: u8,
+}
+
+impl Trigger for PicTrigger {
+    type E = io::Error;
+    fn trigger(&self) -> Result<(), Self::E> {
+        let mut p = self
+            .pic
+            .lock()
+            .map_err(|_| io::Error::other("Poisoned lock"))?;
+        p.set_irq(self.irq, true);
+        p.set_irq(self.irq, false);
+        Ok(())
+    }
+}
+
+/// Trigger that wraps either a NoOp or a PIC IRQ.
+struct SerialTrigger {
+    inner: TriggerType,
+}
+
+enum TriggerType {
+    NoOp(NoOpTrigger),
+    Pic(PicTrigger),
+}
+
+impl Trigger for SerialTrigger {
+    type E = io::Error;
+    fn trigger(&self) -> Result<(), Self::E> {
+        match &self.inner {
+            TriggerType::NoOp(t) => t.trigger(),
+            TriggerType::Pic(t) => t.trigger(),
+        }
+    }
+}
+
 /// Serial Console Wrapper using vm-superio.
 pub struct SerialConsole {
-    device: Serial<NoOpTrigger, NoEvents, Box<dyn Write + Send>>,
+    device: Serial<SerialTrigger, NoEvents, Box<dyn Write + Send>>,
 }
 
 impl SerialConsole {
     /// Create a new SerialConsole instance.
-    /// Polled mode (No Interrupts).
-    pub fn new(_pic: Option<Arc<Mutex<Pic>>>) -> Self {
+    pub fn new(pic: Option<Arc<Mutex<Pic>>>) -> Self {
         // Output to stdout
         let out = Box::new(io::stdout());
 
+        let trigger = if let Some(p) = pic {
+            SerialTrigger {
+                inner: TriggerType::Pic(PicTrigger { pic: p, irq: 4 }), // COM1 is usually IRQ 4
+            }
+        } else {
+            SerialTrigger {
+                inner: TriggerType::NoOp(NoOpTrigger),
+            }
+        };
+
         Self {
-            device: Serial::new(NoOpTrigger, out),
+            device: Serial::new(trigger, out),
         }
     }
 
@@ -61,7 +109,6 @@ impl MutDevicePio for SerialConsole {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn test_serial_creation() {

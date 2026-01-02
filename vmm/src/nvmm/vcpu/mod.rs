@@ -61,7 +61,7 @@ impl<'a> Vcpu<'a> {
         del_ecx: u32,
         del_edx: u32,
     ) -> Result<()> {
-        let mut conf = sys::NvmmVcpuConfCpuid {
+        let conf = sys::NvmmVcpuConfCpuid {
             mask: 1, // mask=1 (set), exit=0
             leaf,
             u: sys::NvmmVcpuConfCpuidUnion {
@@ -87,12 +87,16 @@ impl<'a> Vcpu<'a> {
                 &mut *self.machine.raw,
                 &mut *self.raw,
                 sys::NVMM_VCPU_CONF_CPUID,
-                &mut conf as *mut _ as *mut std::ffi::c_void,
+                &conf as *const _ as *mut _,
             )
         } != 0
         {
             return Err(io::Error::last_os_error().into());
         }
+        debug!(
+            "DEBUG: Configured CPUID Leaf {:#x}: EAX={:#x} EBX={:#x} ECX={:#x} EDX={:#x}",
+            leaf, set_eax, set_ebx, set_ecx, set_edx
+        );
         Ok(())
     }
 
@@ -125,12 +129,9 @@ impl<'a> Vcpu<'a> {
 
     /// Create an injector that can be sent to other threads.
     pub fn injector(&self) -> VcpuInjector {
-        let vcpu_ptr = &*self.raw as *const sys::NvmmVcpu as *mut sys::NvmmVcpu;
-        let mach_ptr = &*self.machine.raw as *const sys::NvmmMachine as *mut sys::NvmmMachine;
-
         VcpuInjector {
-            machine: mach_ptr,
-            vcpu: vcpu_ptr,
+            machine: &*self.machine.raw as *const _ as *mut _,
+            vcpu: &*self.raw as *const _ as *mut _,
             backend: self.machine.backend.clone(),
             tid: self.tid.clone(),
         }
@@ -335,12 +336,11 @@ impl VcpuInjector {
 
     /// Stop the VCPU (kick).
     pub fn stop(&self) -> Result<()> {
-        let tid_val = self.tid.load(Ordering::Relaxed);
-        if tid_val != 0 {
+        let tid = self.tid.load(Ordering::Relaxed);
+        if tid != 0 {
+            // Send SIGUSR1 to the VCPU thread
             unsafe {
-                // Send SIGUSR1 to kick the VCPU thread out of KVM_RUN/ioctl (NVMM equivalent)
-                // libc::pthread_kill returns 0 on success.
-                libc::pthread_kill(tid_val as libc::pthread_t, libc::SIGUSR1);
+                libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1);
             }
         }
         Ok(())
@@ -348,9 +348,8 @@ impl VcpuInjector {
 
     /// Check if Interrupts are enabled (RFLAGS.IF = 1).
     pub fn interrupts_enabled(&self) -> Result<bool> {
-        let state = self.get_state(regs::STATE_GPRS)?;
-        let rflags = state.gprs[regs::GPR_RFLAGS];
-        Ok((rflags & 0x200) != 0)
+        let state = self.get_state(sys::NVMM_X64_STATE_GPRS)?;
+        Ok((state.gprs[regs::GPR_RFLAGS] & (1 << 9)) != 0)
     }
 
     /// Dump the VCPU state (to log/syslog).
@@ -768,12 +767,11 @@ mod tests {
             backend: backend.clone(),
         };
 
-        // Initialize fake VCPU struct
         let mut vcpu = crate::nvmm::Vcpu {
             _id: 0,
             machine: &mut test_machine,
             raw: Box::new(unsafe { std::mem::zeroed() }),
-            tid: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tid: Arc::new(AtomicUsize::new(0)),
         };
 
         // Prepare Exit Struct
@@ -834,7 +832,7 @@ mod tests {
             _id: 0,
             machine: &mut test_machine,
             raw: Box::new(unsafe { std::mem::zeroed() }),
-            tid: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tid: Arc::new(AtomicUsize::new(0)),
         };
 
         let mut event_struct = sys::NvmmX64Event {

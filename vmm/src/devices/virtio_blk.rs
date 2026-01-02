@@ -97,12 +97,12 @@ impl VirtioDeviceActions for BlockDevice {
     type E = anyhow::Error;
 
     fn activate(&mut self) -> anyhow::Result<()> {
-        log::info!("VirtIO Block Activated");
+        log::debug!("VirtIO Block Activated");
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
-        log::info!("VirtIO Block Reset");
+        log::debug!("VirtIO Block Reset");
         Ok(())
     }
 }
@@ -188,7 +188,7 @@ impl MutDeviceMmio for BlockDevice {
             if let Some(pic) = &self.pic {
                 pic.lock().unwrap().set_irq(self.irq_line, false);
             }
-            log::error!(
+            log::debug!(
                 "VirtIO Blk ISR Read (Cleared). IRQ Line {} De-asserted.",
                 self.irq_line
             );
@@ -208,7 +208,7 @@ impl MutDeviceMmio for BlockDevice {
     }
 
     fn mmio_write(&mut self, _base: MmioAddress, offset: u64, data: &[u8]) {
-        log::info!(
+        log::debug!(
             "VirtIO Blk MMIO Write: Offset {:#x}, Data {:?}, Len {}",
             offset,
             data,
@@ -218,7 +218,7 @@ impl MutDeviceMmio for BlockDevice {
         self.write(offset, data);
         if offset == 0x70 {
             // Status
-            log::info!(
+            log::debug!(
                 "VirtIO Blk Status Write. New Status (from config): {:#x}",
                 self.config.device_status
             );

@@ -398,15 +398,15 @@ use vm_device::MutDevicePio;
 use vm_device::bus::PioAddress;
 
 impl MutDevicePio for Pit {
-    fn pio_read(&mut self, _base: PioAddress, offset: u16, data: &mut [u8]) {
+    fn pio_read(&mut self, base: PioAddress, offset: u16, data: &mut [u8]) {
         if data.len() == 1 {
-            data[0] = self.read(offset);
+            data[0] = self.read(base.0 + offset);
         }
     }
 
-    fn pio_write(&mut self, _base: PioAddress, offset: u16, data: &[u8]) {
+    fn pio_write(&mut self, base: PioAddress, offset: u16, data: &[u8]) {
         if data.len() == 1 {
-            self.write(offset, data[0]);
+            self.write(base.0 + offset, data[0]);
         }
     }
 }
