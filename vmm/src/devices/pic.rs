@@ -256,8 +256,9 @@ impl Pic {
             } else {
                 pic.irr &= !mask;
             }
-        } else if level && !last_level { // Edge Rising
-             pic.irr |= mask;
+        } else if level && !last_level {
+            // Edge Rising
+            pic.irr |= mask;
         }
     }
 

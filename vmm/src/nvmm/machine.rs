@@ -21,6 +21,8 @@ impl Drop for Machine {
     }
 }
 
+unsafe impl Send for Machine {}
+
 impl Machine {
     pub fn create_vcpu(&mut self, id: u32) -> Result<Vcpu<'_>> {
         let mut vcpu_box = Box::new(unsafe { std::mem::zeroed::<sys::NvmmVcpu>() });

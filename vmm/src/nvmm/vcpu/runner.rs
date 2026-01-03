@@ -1,6 +1,7 @@
 use crate::nvmm::vcpu::regs;
 
 use crate::Vcpu;
+use crate::nvmm::vcpu::VcpuInjector;
 use crate::types::{VmAction, VmExit};
 use anyhow::{Result, anyhow};
 use futures::future::BoxFuture;
@@ -16,6 +17,7 @@ pub type MemoryHandler<'b> =
 pub type ShutdownHandler<'b> = dyn FnMut() -> BoxFuture<'b, Result<VmAction>> + 'b;
 pub type MsrHandler<'b> = dyn FnMut(u32, bool, u64, u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
 pub type UnknownHandler<'b> = dyn FnMut(u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
+pub type PreRunHandler<'b> = dyn FnMut(VcpuInjector) -> BoxFuture<'b, Result<()>> + 'b;
 
 pub struct VcpuRunner<'a, 'b> {
     vcpu: &'b mut Vcpu<'a>,
@@ -24,10 +26,10 @@ pub struct VcpuRunner<'a, 'b> {
     shutdown_handler: Box<ShutdownHandler<'b>>,
     msr_handler: Box<MsrHandler<'b>>,
     unknown_handler: Box<UnknownHandler<'b>>,
+    pre_run_handler: Box<PreRunHandler<'b>>,
 }
 
 impl<'a, 'b> VcpuRunner<'a, 'b> {
-    #[allow(clippy::new_ret_no_self)]
     #[allow(clippy::new_ret_no_self)]
     pub fn new(vcpu: &'b mut Vcpu<'a>) -> Self {
         let device_mgr_io = vcpu.machine.device_mgr.clone();
@@ -39,6 +41,7 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
             msr_handler: Self::create_msr_handler(),
             memory_handler: Self::create_memory_handler(device_mgr_mem),
             unknown_handler: Self::create_unknown_handler(),
+            pre_run_handler: Box::new(|_| Box::pin(async { Ok(()) })),
         }
     }
 
@@ -237,9 +240,20 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
         self
     }
 
+    pub fn on_pre_run<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut(VcpuInjector) -> BoxFuture<'b, Result<()>> + 'b,
+    {
+        self.pre_run_handler = Box::new(handler);
+        self
+    }
+
     pub async fn run(mut self) -> Result<()> {
         use log::error;
         loop {
+            // Execute Pre-Run Hook (e.g., Interrupt Injection)
+            (self.pre_run_handler)(self.vcpu.injector()).await?;
+
             let exit = self.vcpu.run()?;
             let action = match exit {
                 VmExit::Io {
@@ -263,7 +277,8 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
                 }
                 VmExit::RdMsr { msr, npc } => (self.msr_handler)(msr, false, 0, npc).await?,
                 VmExit::WrMsr { msr, val, npc } => (self.msr_handler)(msr, true, val, npc).await?,
-                VmExit::Interrupted => return Ok(()),
+                VmExit::Interrupted => VmAction::Continue, // Just loop back to pre-run
+
                 VmExit::Halted => VmAction::Continue,
                 VmExit::Unknown(0) => VmAction::Continue,
                 VmExit::Unknown(reason) => {

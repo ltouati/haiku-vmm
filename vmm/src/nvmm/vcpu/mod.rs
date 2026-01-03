@@ -27,6 +27,8 @@ pub struct Vcpu<'a> {
     pub(crate) tid: Arc<AtomicUsize>,
 }
 
+unsafe impl Send for Vcpu<'_> {}
+
 impl<'a> Vcpu<'a> {
     /// Retrieve CPU State.
     pub fn get_state(&mut self, flags: u64) -> Result<sys::NvmmX64State> {
@@ -45,6 +47,12 @@ impl<'a> Vcpu<'a> {
             }
             Ok(*comm_ptr)
         }
+    }
+
+    /// Check if Interrupts are enabled (RFLAGS.IF = 1).
+    pub fn interrupts_enabled(&mut self) -> Result<bool> {
+        let state = self.get_state(sys::NVMM_X64_STATE_GPRS)?;
+        Ok((state.gprs[regs::GPR_RFLAGS] & (1 << 9)) != 0)
     }
 
     /// Configure VCPU (e.g. CPUID).

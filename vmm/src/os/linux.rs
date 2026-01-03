@@ -219,6 +219,7 @@ impl Linux64Guest {
             info!("Loading initrd from {:?}", path);
             let mut f = File::open(path)?;
             let size = f.metadata()?.len();
+
             let addr = GuestAddress(INITRD_START);
             #[allow(deprecated)]
             guest_mem.read_from(addr, &mut f, size as usize)?;
@@ -590,8 +591,8 @@ impl Linux64Guest {
             let pit = pit.clone();
             let pic = pic.clone();
 
-            let lapic = lapic.clone();
-            let mut injector = vcpu.injector();
+
+            let injector = vcpu.injector();
 
             thread::spawn(move || {
                 loop {
@@ -608,21 +609,10 @@ impl Linux64Guest {
 
                     // Injection - Only if interrupts enabled
                     // Injection - Attempt regardless of IF state
-                    // Injection - Only if interrupts enabled
-                    if let Ok(true) = injector.interrupts_enabled() {
-                        // LAPIC Timer (Local)
-                        if let Some(vector) = lapic.lock().expect("Poisoned lock").check_timer() {
-                            let _ = injector.inject_interrupt(vector);
-                            let _ = injector.stop();
-                        }
-
-                        // Master PIC Injection (External)
-                        let mut m = pic.lock().expect("Poisoned lock");
-                        if let Some(vector) = m.get_external_interrupt() {
-                            let _ = injector.inject_interrupt(vector);
-                            let _ = injector.stop();
-                        }
-                    }
+                    // Injection - Only kickoff via stop
+                    // Check if we need to wake up the VCPU for timer checks
+                    // We just kick periodically (1ms) to ensure PreRun hook runs
+                    let _ = injector.stop();
                 }
             });
         }
@@ -876,6 +866,24 @@ impl Linux64Guest {
                     } else {
                         Ok(VmAction::SetRip(npc))
                     }
+                })
+            })
+            .on_pre_run(move |mut injector| {
+                let lapic = lapic.clone();
+                let pic = pic.clone();
+                Box::pin(async move {
+                    // Check if interrupts enabled (Safe here, VCPU stopped)
+                    if let Ok(true) = injector.interrupts_enabled() {
+                       // LAPIC Timer
+                       if let Some(vector) = lapic.lock().expect("Poisoned lock").check_timer() {
+                           let _ = injector.inject_interrupt(vector);
+                       }
+                       // PIC
+                       if let Some(vector) = pic.lock().expect("Poisoned lock").get_external_interrupt() {
+                           let _ = injector.inject_interrupt(vector);
+                       }
+                    }
+                    Ok(())
                 })
             })
             .on_unknown(|reason| {
