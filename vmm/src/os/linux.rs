@@ -591,7 +591,6 @@ impl Linux64Guest {
             let pit = pit.clone();
             let pic = pic.clone();
 
-
             let injector = vcpu.injector();
 
             thread::spawn(move || {
@@ -872,16 +871,28 @@ impl Linux64Guest {
                 let lapic = lapic.clone();
                 let pic = pic.clone();
                 Box::pin(async move {
-                    // Check if interrupts enabled (Safe here, VCPU stopped)
-                    if let Ok(true) = injector.interrupts_enabled() {
-                       // LAPIC Timer
-                       if let Some(vector) = lapic.lock().expect("Poisoned lock").check_timer() {
-                           let _ = injector.inject_interrupt(vector);
-                       }
-                       // PIC
-                       if let Some(vector) = pic.lock().expect("Poisoned lock").get_external_interrupt() {
-                           let _ = injector.inject_interrupt(vector);
-                       }
+                    // Optimized Injection: Only check state if pending interrupts exist
+                    let timer_peek = lapic.lock().expect("Poisoned").peek_timer();
+                    let pic_pending = pic.lock().expect("Poisoned").peek_external_interrupt();
+
+                    #[allow(clippy::collapsible_if)]
+                    if timer_peek.is_some() || pic_pending.is_some() {
+                        if let Ok(true) = injector.interrupts_enabled() {
+                            // LAPIC Timer (Consume)
+                            #[allow(clippy::collapsible_if)]
+                            if timer_peek.is_some() {
+                                if let Some(vector) = lapic.lock().expect("Poisoned").check_timer() {
+                                    let _ = injector.inject_interrupt(vector);
+                                }
+                            }
+                            // PIC (Consume if still pending)
+                            #[allow(clippy::collapsible_if)]
+                            if pic_pending.is_some() {
+                                if let Some(vector) = pic.lock().expect("Poisoned").get_external_interrupt() {
+                                    let _ = injector.inject_interrupt(vector);
+                                }
+                            }
+                        }
                     }
                     Ok(())
                 })

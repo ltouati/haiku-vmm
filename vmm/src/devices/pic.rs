@@ -263,6 +263,36 @@ impl Pic {
     }
 
     /// Primary interface for VCPU to get Interrupt Vector
+    pub fn peek_external_interrupt(&mut self) -> Option<u8> {
+        // 1. Get Highest Priority from Master
+        let (master_slice, slave_slice) = self.pics.split_at_mut(1);
+        let master = &mut master_slice[0];
+        let slave = &mut slave_slice[0];
+
+        let irq = master.get_priority(master.imr)?;
+
+        // 2. Check overlap with ISR (unless Special Mask Mode)
+        if !master.special_mask && (master.isr & (1 << irq)) != 0 {
+            return None;
+        }
+
+        // 3. Resolve Vector (No Ack)
+        if irq == 2 {
+            // Slave
+            if let Some(slave_irq) = slave.get_priority(slave.imr) {
+                // Check Slave overlap
+                if !slave.special_mask && (slave.isr & (1 << slave_irq)) != 0 {
+                    return None;
+                }
+                Some(slave.irq_base.wrapping_add(slave_irq))
+            } else {
+                Some(master.irq_base.wrapping_add(irq)) // Spurious? Or Master IRQ2?
+            }
+        } else {
+            Some(master.irq_base.wrapping_add(irq))
+        }
+    }
+
     pub fn get_external_interrupt(&mut self) -> Option<u8> {
         // 1. Get Highest Priority from Master
         // Split modify to avoid double borrow

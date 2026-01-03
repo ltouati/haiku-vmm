@@ -130,7 +130,21 @@ impl Lapic {
         0
     }
 
-    // Check if interrupt pending
+    // Check if interrupt pending (No state change)
+    #[allow(clippy::collapsible_if)]
+    pub fn peek_timer(&self) -> Option<u8> {
+        if self.lvt_timer_masked || self.initial_count == 0 {
+            return None;
+        }
+        if let Some(start) = self.start_time {
+            if start.elapsed().as_millis() > 10 && self.timer_mode == 1 {
+                return Some(self.lvt_timer_vector);
+            }
+        }
+        None
+    }
+
+    // Check if interrupt pending (Consumes current tick)
     pub fn check_timer(&mut self) -> Option<u8> {
         if self.lvt_timer_masked || self.initial_count == 0 {
             return None;
