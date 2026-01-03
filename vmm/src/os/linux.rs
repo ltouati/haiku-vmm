@@ -46,6 +46,7 @@ const ZERO_PAGE_START: u64 = 0x7000;
 const BOOT_GDT_OFFSET: u64 = 0x1000;
 const TSS_START: u64 = 0x600;
 const _PAGE_TABLE_START: u64 = 0xa000;
+const INITRD_START: u64 = 0x4000000; // 64MB
 
 // VirtIO Block Defaults
 const VIRTIO_BLK_ADDR: u64 = 0xd0000000;
@@ -64,6 +65,7 @@ pub struct Linux64Guest {
     pub cmdline: String,
     pub memory_size_mib: u64,
     pub disk_path: Option<PathBuf>,
+    pub initrd_path: Option<PathBuf>,
     mmio_devices: Vec<VirtioMmioConfig>,
 }
 
@@ -119,6 +121,7 @@ impl Linux64Guest {
         cmdline: String,
         memory_size_mib: u64,
         disk_path: Option<PathBuf>,
+        initrd_path: Option<PathBuf>,
     ) -> Self {
         let mut mmio_devices = Vec::new();
 
@@ -135,6 +138,7 @@ impl Linux64Guest {
             cmdline,
             memory_size_mib,
             disk_path,
+            initrd_path,
             mmio_devices,
         }
     }
@@ -158,8 +162,11 @@ impl Linux64Guest {
         // 2. Load Kernel
         let (entry_point, _is_long_mode) = self.load_kernel(&guest_mem)?;
 
+        // 2a. Load Initrd
+        let initrd_info = self.load_initrd(&guest_mem)?;
+
         // 3. Configure Boot Params
-        self.configure_boot_params(&guest_mem)?;
+        self.configure_boot_params(&guest_mem, initrd_info)?;
 
         // 4. Setup VCPU
         let vcpu = self.setup_vcpu_state(machine, &guest_mem, entry_point)?;
@@ -207,7 +214,25 @@ impl Linux64Guest {
         }
     }
 
-    fn configure_boot_params(&self, guest_mem: &GuestMemoryMmap) -> anyhow::Result<()> {
+    fn load_initrd(&self, guest_mem: &GuestMemoryMmap) -> anyhow::Result<Option<(u64, u64)>> {
+        if let Some(path) = &self.initrd_path {
+            info!("Loading initrd from {:?}", path);
+            let mut f = File::open(path)?;
+            let size = f.metadata()?.len();
+            let addr = GuestAddress(INITRD_START);
+            #[allow(deprecated)]
+            guest_mem.read_from(addr, &mut f, size as usize)?;
+            Ok(Some((INITRD_START, size)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn configure_boot_params(
+        &self,
+        guest_mem: &GuestMemoryMmap,
+        initrd: Option<(u64, u64)>,
+    ) -> anyhow::Result<()> {
         let mem_size = self.memory_size_mib * 1024 * 1024;
         let mut params = boot_params::default();
 
@@ -245,7 +270,13 @@ impl Linux64Guest {
         }
         params.hdr.cmd_line_ptr = BOOT_CMD_START as u32;
         params.hdr.cmdline_size = cmdline.len() as u32 + 1;
+        params.hdr.cmdline_size = cmdline.len() as u32 + 1;
         params.hdr.kernel_alignment = 0x01000000; // 16MB Alignment
+
+        if let Some((addr, size)) = initrd {
+            params.hdr.ramdisk_image = addr as u32;
+            params.hdr.ramdisk_size = size as u32;
+        }
 
         add_e820_entry(&mut params, 0, 0x9fc00, 1);
         add_e820_entry(&mut params, HIMEM_START, mem_size - HIMEM_START, 1);
@@ -407,12 +438,13 @@ impl Linux64Guest {
         vcpu.configure_cpuid(0x4000_0001, 0x1 | 0x8, 0, 0, 0, 0, 0, 0, 0)?;
 
         // Initialize PICs (Moved up for Serial Dependency)
-        let master_pic = Arc::new(Mutex::new(Pic::new(true)));
-        let slave_pic = Arc::new(Mutex::new(Pic::new(false)));
+        // Initialize PIC (Unified)
+        let pic = Arc::new(Mutex::new(Pic::new()));
 
         // Initialize Devices (Thread-Safe)
         let pit = Arc::new(Mutex::new(Pit::new()));
-        let serial = Arc::new(Mutex::new(SerialConsole::new(Some(master_pic.clone()))));
+        let serial = Arc::new(Mutex::new(SerialConsole::new(Some(pic.clone()))));
+
         let rtc = Arc::new(Mutex::new(RtcWrapper::new()));
         let lapic = Arc::new(Mutex::new(Lapic::new()));
 
@@ -483,16 +515,32 @@ impl Linux64Guest {
                 .register_pio(
                     PioRange::new(PioAddress(0x20), 2)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
-                    master_pic.clone(),
+                    pic.clone(),
                 )
                 .context("Master PIC")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0xA0), 2)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
-                    slave_pic.clone(),
+                    pic.clone(),
                 )
                 .context("Slave PIC")?;
+
+            // Register ELCR Ports
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0x4D0), 1)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    pic.clone(),
+                )
+                .context("ELCR1")?;
+            device_mgr
+                .register_pio(
+                    PioRange::new(PioAddress(0x4D1), 1)
+                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                    pic.clone(),
+                )
+                .context("ELCR2")?;
 
             let pci_stub = Arc::new(Mutex::new(PciStub));
             device_mgr
@@ -525,7 +573,7 @@ impl Linux64Guest {
                 {
                     let mut blk = virtio_blk.lock().expect("Poisoned lock");
                     blk.set_memory(guest_mem.clone());
-                    blk.set_injector(vcpu.injector(), master_pic.clone(), VIRTIO_BLK_IRQ as u8); // IRQ 5 (Conflict Free)
+                    blk.set_injector(vcpu.injector(), pic.clone(), VIRTIO_BLK_IRQ as u8); // IRQ 5 (Conflict Free)
                 }
                 device_mgr
                     .register_mmio(
@@ -540,7 +588,8 @@ impl Linux64Guest {
         // Spawn Timer Thread
         {
             let pit = pit.clone();
-            let master_pic = master_pic.clone();
+            let pic = pic.clone();
+
             let lapic = lapic.clone();
             let mut injector = vcpu.injector();
 
@@ -551,11 +600,14 @@ impl Linux64Guest {
                     // PIT (Legacy) - Always update source state
                     let mut p = pit.lock().expect("Poisoned lock");
                     if p.update_irq() > 0 {
-                        let mut m = master_pic.lock().expect("Poisoned lock");
+                        let mut m = pic.lock().expect("Poisoned lock");
+
                         m.set_irq(0, true);
                         m.set_irq(0, false);
                     }
 
+                    // Injection - Only if interrupts enabled
+                    // Injection - Attempt regardless of IF state
                     // Injection - Only if interrupts enabled
                     if let Ok(true) = injector.interrupts_enabled() {
                         // LAPIC Timer (Local)
@@ -565,8 +617,8 @@ impl Linux64Guest {
                         }
 
                         // Master PIC Injection (External)
-                        let mut m = master_pic.lock().expect("Poisoned lock");
-                        if let Some(vector) = m.ack_interrupt() {
+                        let mut m = pic.lock().expect("Poisoned lock");
+                        if let Some(vector) = m.get_external_interrupt() {
                             let _ = injector.inject_interrupt(vector);
                             let _ = injector.stop();
                         }

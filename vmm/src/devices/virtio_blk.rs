@@ -155,19 +155,16 @@ impl VirtioMmioDevice for BlockDevice {
             }
         }
 
-        if needs_interrupt && let Some(injector) = &mut self.injector {
+        if needs_interrupt && let Some(_injector) = &mut self.injector {
             self.config
                 .interrupt_status
                 .store(1, std::sync::atomic::Ordering::SeqCst);
 
-            // Route through PIC
+            // Route through PIC (Set IRQ line High)
             if let Some(pic) = &self.pic {
                 let mut p = pic.lock().unwrap();
                 p.set_irq(self.irq_line, true);
-                if let Some(vector) = p.ack_interrupt() {
-                    injector.inject_interrupt(vector).ok();
-                    log::debug!("Injected Vector {} (IRQ {})", vector, self.irq_line);
-                }
+                // No manual injection. Polling Thread handles it.
             }
         }
     }
@@ -180,19 +177,14 @@ impl MutDeviceMmio for BlockDevice {
         // VIRTIO_MMIO_INTERRUPT_STATUS = 0x60
         // Reading this register returns the interrupt status and clears it.
         if offset == 0x60 {
-            // Clear the status
-            self.config
-                .interrupt_status
-                .store(0, std::sync::atomic::Ordering::SeqCst);
-            // De-assert the interrupt line on the PIC
-            if let Some(pic) = &self.pic {
-                pic.lock().unwrap().set_irq(self.irq_line, false);
-            }
+            // Read Status - Do NOT clear. Spec says Write to ACK (0x64) clears it.
+            // Just return data (already done by self.read above which copies from config space)
             log::debug!(
-                "VirtIO Blk ISR Read (Cleared). IRQ Line {} De-asserted.",
-                self.irq_line
+                "VirtIO Blk ISR Read. Status: {:#x}",
+                self.config
+                    .interrupt_status
+                    .load(std::sync::atomic::Ordering::SeqCst)
             );
-            log::debug!("VirtIO Blk ISR Read (Cleared). Data: {:?}", data);
         }
 
         log::debug!(
@@ -217,11 +209,45 @@ impl MutDeviceMmio for BlockDevice {
         // Check legacy status access if possible, or just observe effects
         self.write(offset, data);
         if offset == 0x70 {
-            // Status
+            // Status update
             log::debug!(
                 "VirtIO Blk Status Write. New Status (from config): {:#x}",
                 self.config.device_status
             );
+        } else if offset == 0x64 {
+            // VIRTIO_MMIO_INTERRUPT_ACK = 0x64
+            // Writing a value with bits set clears the corresponding bits in the InterruptStatus register.
+            let ack = if data.len() == 4 {
+                u32::from_le_bytes(data.try_into().unwrap())
+            } else {
+                data[0] as u32 // Partial/byte write? Assume 32-bit usually.
+            };
+
+            // Clear bits
+            // fetch_and with !ack (bitwise NAND?)
+            // We want (status & !ack).
+            // atomic.fetch_and takes the value to AND with. So passed value is !ack.
+            self.config
+                .interrupt_status
+                .fetch_and(!(ack as u8), std::sync::atomic::Ordering::SeqCst);
+
+            // If status is now 0, de-assert IRQ
+            // We need to read it back OR check logic.
+            // Simplified: If ACK matches Used Ring (bit 0) or Configuration (bit 1), de-assert?
+            // Actually, if we clear the bits that CAUSED the interrupt, we should de-assert.
+            // Since we only use bit 0 (Used Buffer) mostly.
+            // Let's just Check current status.
+            let current = self
+                .config
+                .interrupt_status
+                .load(std::sync::atomic::Ordering::SeqCst);
+            #[allow(clippy::collapsible_if)]
+            if current == 0 {
+                if let Some(pic) = &self.pic {
+                    pic.lock().unwrap().set_irq(self.irq_line, false);
+                    log::debug!("VirtIO Blk IRQ {} De-asserted via ACK", self.irq_line);
+                }
+            }
         }
     }
 }

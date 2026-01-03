@@ -26,6 +26,10 @@ struct Args {
     /// Path to a raw disk image
     #[arg(short, long)]
     disk: Option<PathBuf>,
+
+    /// Path to initrd
+    #[arg(long)]
+    initrd: Option<PathBuf>,
 }
 
 // Helper re-implemented or imported?
@@ -43,7 +47,13 @@ async fn main() -> anyhow::Result<()> {
     let mut machine = sys.create_machine()?;
 
     // Use Linux64Guest to setup the machine
-    let guest = Linux64Guest::new(args.kernel, args.cmdline, args.memory, args.disk);
+    let guest = Linux64Guest::new(
+        args.kernel,
+        args.cmdline,
+        args.memory,
+        args.disk,
+        args.initrd,
+    );
     let (guest_mem, mut vcpu) = guest.load(&mut machine)?;
 
     // Create injector for the signal thread
