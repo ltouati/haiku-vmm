@@ -74,6 +74,17 @@ pub struct NvmmCommPage {
 // Structs from x86/nvmm_x86.h
 // -----------------------------------------------------------------------------
 
+// Segments
+pub const NVMM_X64_SEG_ES: usize = 0;
+pub const NVMM_X64_SEG_CS: usize = 1;
+pub const NVMM_X64_SEG_SS: usize = 2;
+pub const NVMM_X64_SEG_DS: usize = 3;
+pub const NVMM_X64_SEG_FS: usize = 4;
+pub const NVMM_X64_SEG_GS: usize = 5;
+pub const NVMM_X64_SEG_GDT: usize = 6;
+pub const NVMM_X64_SEG_IDT: usize = 7;
+pub const NVMM_X64_SEG_LDT: usize = 8;
+pub const NVMM_X64_SEG_TR: usize = 9;
 pub const NVMM_X64_NSEG: usize = 10;
 pub const NVMM_X64_NGPR: usize = 18;
 pub const NVMM_X64_NCR: usize = 6;
