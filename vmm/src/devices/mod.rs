@@ -1,3 +1,4 @@
+pub mod cmos;
 pub mod i8042;
 pub mod lapic;
 pub mod pic;
@@ -8,6 +9,7 @@ pub mod virtio_blk;
 pub mod virtio_console;
 pub mod virtio_rng;
 
+pub use cmos::Cmos;
 pub use i8042::I8042Wrapper;
 pub use lapic::Lapic;
 pub use pic::Pic;
