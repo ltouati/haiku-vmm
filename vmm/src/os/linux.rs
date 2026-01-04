@@ -57,11 +57,11 @@ const VIRTIO_BLK_IRQ: u32 = 5;
 
 // VirtIO RNG Defaults
 const VIRTIO_RNG_ADDR: u64 = 0xd0001000; // 4K after Block
-const VIRTIO_RNG_IRQ: u32 = 6;
+const VIRTIO_RNG_IRQ: u32 = 10;
 
 // VirtIO Console Defaults
 const VIRTIO_CONSOLE_ADDR: u64 = 0xd0002000; // 4K after RNG
-const VIRTIO_CONSOLE_IRQ: u32 = 7;
+const VIRTIO_CONSOLE_IRQ: u32 = 11;
 
 #[derive(Clone)]
 struct VirtioMmioConfig {
@@ -156,7 +156,6 @@ impl Linux64Guest {
             size: 0x1000,
             irq: VIRTIO_CONSOLE_IRQ,
         });
-
         Self {
             kernel_path,
             cmdline,
