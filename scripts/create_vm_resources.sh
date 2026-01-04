@@ -160,6 +160,26 @@ create_rootfs() {
     # --variant=minbase for smallest size
     sudo debootstrap --arch=amd64 "${UBUNTU_RELEASE}" "${MOUNT_DIR}" http://archive.ubuntu.com/ubuntu/
     
+    echo "Installing essential packages..."
+    # Mount necessary filesystems for chroot
+    sudo mount --bind /dev "${MOUNT_DIR}/dev"
+    sudo mount --bind /dev/pts "${MOUNT_DIR}/dev/pts"
+    sudo mount -t proc proc "${MOUNT_DIR}/proc"
+    sudo mount -t sysfs sysfs "${MOUNT_DIR}/sys"
+    
+    # Update and upgrade to fix library version mismatches
+    sudo chroot "${MOUNT_DIR}" apt-get update
+    sudo chroot "${MOUNT_DIR}" apt-get upgrade -y
+    # Install init system and dependencies (fix libgpg-error/libgcrypt issues)
+    sudo chroot "${MOUNT_DIR}" apt-get install -y systemd init udev kmod iproute2 libgpg-error0
+    sudo chroot "${MOUNT_DIR}" apt-get clean
+    
+    # Unmount chroot filesystems
+    sudo umount "${MOUNT_DIR}/sys" || true
+    sudo umount "${MOUNT_DIR}/proc" || true
+    sudo umount "${MOUNT_DIR}/dev/pts" || true
+    sudo umount "${MOUNT_DIR}/dev" || true
+    
     echo "Configuring RootFS..."
     
     # Fstab
@@ -183,7 +203,7 @@ EOF
     # Note: On Jammy/Noble, systemd generator usually works.
     # We force it just in case.
     if [ -f "${MOUNT_DIR}/lib/systemd/system/serial-getty@.service" ]; then
-         sudo chroot "${MOUNT_DIR}" systemctl enable serial-getty@ttyS0.service
+         sudo chroot "${MOUNT_DIR}" systemctl enable serial-getty@ttyS0.service 2>/dev/null || true
     fi
     
     # Update Library Cache (Fix potential GPG_ERROR/Loading issues)
