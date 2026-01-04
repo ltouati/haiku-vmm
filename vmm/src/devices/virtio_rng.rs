@@ -71,7 +71,7 @@ impl RngDevice {
             None => return Ok(false),
         };
 
-        let mut used_any = false;
+        let mut needs_interrupt = false;
 
         while let Some(mut chain) = queue
             .iter(mem)
@@ -121,11 +121,14 @@ impl RngDevice {
                 queue
                     .add_used(mem, chain.head_index(), total_written as u32)
                     .unwrap();
-                used_any = true;
+                
+                if queue.needs_notification(mem).unwrap_or(true) {
+                    needs_interrupt = true;
+                }
             }
         }
 
-        Ok(used_any)
+        Ok(needs_interrupt)
     }
 }
 
@@ -141,6 +144,20 @@ impl MutDeviceMmio for RngDevice {
 
     fn mmio_write(&mut self, _base: vm_device::bus::MmioAddress, offset: u64, data: &[u8]) {
         self.write(offset, data);
+        if offset == 0x64 { // Interrupt ACK
+             let ack = if data.len() == 4 {
+                u32::from_le_bytes(data.try_into().unwrap())
+            } else {
+                data[0] as u32
+            };
+            self.config.interrupt_status.fetch_and(!(ack as u8), std::sync::atomic::Ordering::SeqCst);
+             let current = self.config.interrupt_status.load(std::sync::atomic::Ordering::SeqCst);
+            if current == 0 {
+                 if let Some(pic) = &self.pic {
+                    pic.lock().unwrap().set_irq(self.irq_line, false);
+                }
+            }
+        }
     }
 }
 
@@ -181,14 +198,7 @@ impl VirtioMmioDevice for RngDevice {
         match self.process_queue() {
             Ok(needs_irq) => {
                 if needs_irq {
-                    // Fix: Injector needs to be mutable.
-                    // Option iter gives ref implicitly if using &self.injector.
-                    // We need `as_mut` or structure change.
-                    // VcpuInjector::inject_interrupt is likely `&self` though?
-                    // Let's check `VcpuInjector` definition.
-                    // Assuming for now `inject_interrupt` takes `&mut self`.
-                    // If so, we need `if let (Some(injector), ...)` binding to match mutable reference?
-                    // No, we need `as_mut`.
+                    self.config.interrupt_status.store(1, std::sync::atomic::Ordering::SeqCst);
 
                     if let (Some(_injector), Some(pic)) = (self.injector.as_mut(), &self.pic) {
                         let mut pic_lock = pic.lock().unwrap();
@@ -201,4 +211,5 @@ impl VirtioMmioDevice for RngDevice {
             Err(e) => log::error!("RNG queue processing error: {:?}", e),
         }
     }
+
 }
