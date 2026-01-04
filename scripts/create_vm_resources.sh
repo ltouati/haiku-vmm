@@ -58,47 +58,19 @@ build_kernel() {
     echo "Configuring kernel..."
     make defconfig
 
-    # --- Minimalization: Strip Unnecessary Drivers ---
-    # Disable PCI (VMM uses MMIO) - Only needed if user runs pci=off
-    # But usually harmless to keep. If user requested minimal, we disable it.
-    ./scripts/config --disable CONFIG_PCI
+    # --- Reverting Minimalization (Restoring Standard Drivers) ---
+    # We keep standard drivers (PCI, USB) enabled to ensure compatibility
+    # with Ubuntu's generic userspace (which might probe them).
+    ./scripts/config --enable CONFIG_PCI
+    ./scripts/config --enable CONFIG_ACPI
     
-    # Disable Multimedia/Sound
-    ./scripts/config --disable CONFIG_SOUND
-    ./scripts/config --disable CONFIG_MEDIA_SUPPORT
-    
-    # Disable Graphics/DRM (Headless VMM)
-    ./scripts/config --disable CONFIG_AGP
-    ./scripts/config --disable CONFIG_DRM
-    
-    # Disable USB
-    ./scripts/config --disable CONFIG_USB_SUPPORT
-    ./scripts/config --disable CONFIG_USB
-    
-    # Disable Wireless/Bluetooth
-    ./scripts/config --disable CONFIG_WIRELESS
-    ./scripts/config --disable CONFIG_WLAN
-    ./scripts/config --disable CONFIG_BT
-    
-    # Disable unnecessary Network Drivers (Keep only VirtIO)
-    ./scripts/config --disable CONFIG_NET_VENDOR_AMAZON
-    ./scripts/config --disable CONFIG_NET_VENDOR_AMD
-    ./scripts/config --disable CONFIG_NET_VENDOR_BROADCOM
-    ./scripts/config --disable CONFIG_NET_VENDOR_INTEL
-    ./scripts/config --disable CONFIG_NET_VENDOR_REALTEK
-    # (And so on... generic vendor disabling helps)
-    ./scripts/config --disable CONFIG_ETHERNET
-    
-    # Disable Input Devices (Mouse/Joystick/Tablet - Keep Keyboard/Evdev?)
-    ./scripts/config --disable CONFIG_INPUT_MOUSE
-    ./scripts/config --disable CONFIG_INPUT_JOYSTICK
-    ./scripts/config --disable CONFIG_INPUT_TABLET
-    ./scripts/config --disable CONFIG_INPUT_TOUCHSCREEN
-    
-    # --- End Minimalization ---
-    
-    # Enable VirtIO and MMIO
+    # We still disable hefty multimedia/drm if desired, but let's be safe first.
+    # ./scripts/config --disable CONFIG_DRM
+    # ./scripts/config --disable CONFIG_SOUND
+
+    # Keep VirtIO and MMIO
     ./scripts/config --enable CONFIG_VIRTIO
+    ./scripts/config --enable CONFIG_VIRTIO_MENU
     ./scripts/config --enable CONFIG_VIRTIO_MENU
     ./scripts/config --enable CONFIG_VIRTIO_MMIO
     ./scripts/config --enable CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES
@@ -136,9 +108,21 @@ build_kernel() {
     ./scripts/config --enable CONFIG_EPOLL
     ./scripts/config --enable CONFIG_IPV6
 
+    # Systemd / Userspace Safety (Critical)
+    ./scripts/config --enable CONFIG_SECCOMP
+    ./scripts/config --enable CONFIG_SECCOMP_FILTER
+    ./scripts/config --enable CONFIG_TMPFS_XATTR
+    ./scripts/config --enable CONFIG_TMPFS_POSIX_ACL
+    ./scripts/config --enable CONFIG_FILE_LOCKING
+    ./scripts/config --enable CONFIG_MULTIUSER
+
     # KVM/Paravirt Support (Performance & Timing)
     ./scripts/config --enable CONFIG_HYPERVISOR_GUEST
     ./scripts/config --enable CONFIG_KVM_GUEST
+    
+    # RNG Support (User Requested)
+    ./scripts/config --enable CONFIG_HW_RANDOM
+    ./scripts/config --enable CONFIG_HW_RANDOM_VIRTIO
     ./scripts/config --enable CONFIG_PARAVIRT
     ./scripts/config --enable CONFIG_PARAVIRT_SPINLOCKS
 
@@ -201,6 +185,10 @@ EOF
     if [ -f "${MOUNT_DIR}/lib/systemd/system/serial-getty@.service" ]; then
          sudo chroot "${MOUNT_DIR}" systemctl enable serial-getty@ttyS0.service
     fi
+    
+    # Update Library Cache (Fix potential GPG_ERROR/Loading issues)
+    echo "Updating library cache..."
+    sudo chroot "${MOUNT_DIR}" ldconfig
     
     echo "Unmounting..."
     sudo umount "${MOUNT_DIR}"

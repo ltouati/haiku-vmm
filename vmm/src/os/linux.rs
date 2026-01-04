@@ -21,6 +21,8 @@ use crate::devices::rtc::RtcWrapper;
 use crate::devices::serial::SerialConsole;
 
 use crate::devices::virtio_blk::BlockDevice;
+use crate::devices::virtio_console::ConsoleDevice;
+use crate::devices::virtio_rng::RngDevice;
 use crate::nvmm::sys;
 use crate::nvmm::vcpu::regs;
 use crate::{Machine, Vcpu, VmAction};
@@ -52,6 +54,14 @@ const INITRD_START: u64 = 0x4000000; // 64MB
 const VIRTIO_BLK_ADDR: u64 = 0xd0000000;
 const VIRTIO_BLK_SIZE: u64 = 0x1000;
 const VIRTIO_BLK_IRQ: u32 = 5;
+
+// VirtIO RNG Defaults
+const VIRTIO_RNG_ADDR: u64 = 0xd0001000; // 4K after Block
+const VIRTIO_RNG_IRQ: u32 = 6;
+
+// VirtIO Console Defaults
+const VIRTIO_CONSOLE_ADDR: u64 = 0xd0002000; // 4K after RNG
+const VIRTIO_CONSOLE_IRQ: u32 = 7;
 
 #[derive(Clone)]
 struct VirtioMmioConfig {
@@ -132,6 +142,20 @@ impl Linux64Guest {
                 irq: VIRTIO_BLK_IRQ,
             });
         }
+
+        // Always Add RNG
+        mmio_devices.push(VirtioMmioConfig {
+            base: VIRTIO_RNG_ADDR,
+            size: 0x1000, // 4K
+            irq: VIRTIO_RNG_IRQ,
+        });
+
+        // Always Add Console
+        mmio_devices.push(VirtioMmioConfig {
+            base: VIRTIO_CONSOLE_ADDR,
+            size: 0x1000,
+            irq: VIRTIO_CONSOLE_IRQ,
+        });
 
         Self {
             kernel_path,
@@ -453,6 +477,9 @@ impl Linux64Guest {
         let reset_evt = Arc::new(AtomicBool::new(false));
         let i8042 = Arc::new(Mutex::new(I8042Wrapper::new(reset_evt.clone())));
 
+        // Initialize VirtIO Console (Early for Scope)
+        let virtio_console = Arc::new(Mutex::new(ConsoleDevice::new()?));
+
         {
             let mut device_mgr = vcpu
                 .machine
@@ -584,6 +611,39 @@ impl Linux64Guest {
                     )
                     .context("Failed to register VirtIO Block")?;
             }
+
+            // Initialize VirtIO RNG
+            {
+                info!("Initializing VirtIO RNG");
+                let virtio_rng = Arc::new(Mutex::new(RngDevice::new()?));
+                {
+                    let mut rng = virtio_rng.lock().expect("Poisoned lock");
+                    rng.set_memory(guest_mem.clone());
+                    rng.set_injector(vcpu.injector(), pic.clone(), VIRTIO_RNG_IRQ as u8);
+                }
+                device_mgr
+                    .register_mmio(
+                        MmioRange::new(MmioAddress(VIRTIO_RNG_ADDR), 0x1000)
+                            .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
+                        virtio_rng.clone(),
+                    )
+                    .context("Failed to register VirtIO RNG")?;
+            }
+
+            // Initialize VirtIO Console
+            {
+                info!("Initializing VirtIO Console");
+                let mut console = virtio_console.lock().expect("Poisoned lock");
+                console.set_memory(guest_mem.clone());
+                console.set_injector(vcpu.injector(), pic.clone(), VIRTIO_CONSOLE_IRQ as u8);
+            }
+            device_mgr
+                .register_mmio(
+                    MmioRange::new(MmioAddress(VIRTIO_CONSOLE_ADDR), 0x1000)
+                        .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
+                    virtio_console.clone(),
+                )
+                .context("Failed to register VirtIO Console")?;
         }
 
         // Spawn Timer Thread
@@ -606,17 +666,14 @@ impl Linux64Guest {
                         m.set_irq(0, false);
                     }
 
-                    // Injection - Only if interrupts enabled
-                    // Injection - Attempt regardless of IF state
-                    // Injection - Only kickoff via stop
-                    // Check if we need to wake up the VCPU for timer checks
-                    // We just kick periodically (1ms) to ensure PreRun hook runs
+                    // Injection
                     let _ = injector.stop();
                 }
             });
         }
 
         let serial_in = serial.clone();
+        let console_in = virtio_console.clone();
         thread::spawn(move || {
             let mut buffer = [0; 1];
             loop {
@@ -627,6 +684,12 @@ impl Linux64Guest {
                             .lock()
                             .expect("Poisoned lock")
                             .queue_input(&buffer);
+
+                        console_in
+                            .lock()
+                            .expect("Poisoned lock")
+                            .queue_input(&buffer);
+
                         // Local echo
                         let _ = io::stdout().write(&buffer);
                         let _ = io::stdout().flush();
