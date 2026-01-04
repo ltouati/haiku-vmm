@@ -190,11 +190,11 @@ impl VirtioMmioDevice for RngDevice {
                     // If so, we need `if let (Some(injector), ...)` binding to match mutable reference?
                     // No, we need `as_mut`.
 
-                    if let (Some(injector), Some(pic)) = (self.injector.as_mut(), &self.pic) {
+                    if let (Some(_injector), Some(pic)) = (self.injector.as_mut(), &self.pic) {
                         let mut pic_lock = pic.lock().unwrap();
                         pic_lock.set_irq(self.irq_line, true);
-
-                        let _ = injector.inject_interrupt(self.irq_line);
+                        pic_lock.set_irq(self.irq_line, false);
+                        // let _ = injector.inject_interrupt(self.irq_line); // Handled by PIC Polling
                     }
                 }
             }

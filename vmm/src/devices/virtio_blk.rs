@@ -160,12 +160,17 @@ impl VirtioMmioDevice for BlockDevice {
                 .interrupt_status
                 .store(1, std::sync::atomic::Ordering::SeqCst);
 
-            // Route through PIC (Set IRQ line High)
+            // Route through PIC (Pulse)
             if let Some(pic) = &self.pic {
                 let mut p = pic.lock().unwrap();
                 p.set_irq(self.irq_line, true);
-                // No manual injection. Polling Thread handles it.
+                p.set_irq(self.irq_line, false);
             }
+            
+            // Manual Injection Removed - Handled by PIC Polling
+            /* if let Some(inj) = &mut self.injector {
+                let _ = inj.inject_interrupt(self.irq_line as u8);
+            } */
         }
     }
 }
