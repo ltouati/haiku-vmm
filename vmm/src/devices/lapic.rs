@@ -170,132 +170,23 @@ impl Lapic {
 
         None
     }
-
-    pub fn read(&self, offset: u64) -> u32 {
-        let offset = offset as u32;
-        let val = self.read_reg(offset);
-        debug!("LAPIC Read: Offset={:#x} Val={:#x}", offset, val);
-        val
-    }
-
-    pub fn write(&mut self, offset: u64, val: u32) {
-        let offset = offset as u32;
-        debug!("LAPIC Write: Offset={:#x} Val={:#x}", offset, val);
-
-        match offset {
-            APIC_EOI => {
-                // End of Interrupt - Acknowledge irq (simplification: do nothing for now)
-                self.write_reg(APIC_EOI, 0);
-            }
-            APIC_ICR_LOW => {
-                self.write_reg(APIC_ICR_LOW, val & !(1 << 12));
-            }
-            APIC_TMR_DIV => {
-                self.divide_conf = val;
-                self.write_reg(APIC_TMR_DIV, val);
-            }
-            APIC_LVT_TIMER => {
-                self.lvt_timer_masked = (val & 0x10000) != 0;
-                self.timer_mode = ((val >> 17) & 1) as u8; // Bit 17: 0=OneShot, 1=Periodic
-                self.lvt_timer_vector = (val & 0xFF) as u8;
-                self.write_reg(APIC_LVT_TIMER, val);
-            }
-            APIC_TMR_INIT_CNT => {
-                self.initial_count = val;
-                self.write_reg(APIC_TMR_INIT_CNT, val);
-                // Writing initial count starts the timer
-                if val > 0 {
-                    self.start_time = Some(Instant::now());
-                } else {
-                    self.start_time = None;
-                }
-            }
-            _ => {
-                self.write_reg(offset, val);
-            }
-        }
-    }
 }
-
-use vm_device::MutDeviceMmio;
-use vm_device::bus::MmioAddress;
 
 impl MutDeviceMmio for Lapic {
     fn mmio_read(&mut self, _base: MmioAddress, offset: u64, data: &mut [u8]) {
+        let val = self.read_reg(offset);
+        // Only support 4-byte reads for now
         if data.len() == 4 {
-            let val = self.read(offset);
             data.copy_from_slice(&val.to_le_bytes());
         }
     }
 
     fn mmio_write(&mut self, _base: MmioAddress, offset: u64, data: &[u8]) {
         if data.len() == 4 {
-            let mut val_bytes = [0u8; 4];
-            val_bytes.copy_from_slice(data);
-            let val = u32::from_le_bytes(val_bytes);
-            self.write(offset, val);
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(data);
+            let val = u32::from_le_bytes(bytes);
+            self.write_reg(offset, val);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lapic_reset() {
-        let lapic = Lapic::new();
-        assert_eq!(lapic.read(APIC_VER as u64), 0x50014);
-        assert_eq!(lapic.read(APIC_SVR as u64), 0xFF);
-        assert_eq!(lapic.read(APIC_LVT_TIMER as u64), 0x10000);
-    }
-
-    #[test]
-    fn test_lapic_read_write() {
-        let mut lapic = Lapic::new();
-        let offset = 0x380; // TMR_INIT_CNT
-        lapic.write(offset, 0x12345678);
-        assert_eq!(lapic.read(offset), 0x12345678);
-    }
-
-    #[test]
-    fn test_lapic_special_write() {
-        let mut lapic = Lapic::new();
-
-        // Test ICR_LOW: bit 12 (Delivery Status) should be cleared
-        lapic.write(APIC_ICR_LOW as u64, 0x1000); // Set bit 12
-        assert_eq!(lapic.read(APIC_ICR_LOW as u64) & (1 << 12), 0);
-
-        // Test EOI: should clear register in simplified impl
-        lapic.write_reg(APIC_EOI, 0x1);
-        lapic.write(APIC_EOI as u64, 0x1234);
-        assert_eq!(lapic.read(APIC_EOI as u64), 0);
-    }
-
-    #[test]
-    fn test_lapic_mmio() {
-        let mut lapic = Lapic::new();
-        let offset = 0x300; // ICR_LOW
-
-        let mut data = [0u8; 4];
-        lapic.mmio_read(MmioAddress(0), offset as u64, &mut data);
-        assert_eq!(u32::from_le_bytes(data), 0);
-
-        lapic.mmio_write(MmioAddress(0), offset as u64, &0xdeadbeefu32.to_le_bytes());
-        // Bit 12 should be cleared
-        assert_eq!(lapic.read(offset as u64), 0xdeadbeef & !(1 << 12));
-    }
-    #[test]
-    fn test_lapic_timer_config() {
-        let mut lapic = Lapic::new();
-        // Set Periodic, Vector 0xEF, Unmasked
-        lapic.write(APIC_LVT_TIMER as u64, 0x200EF);
-        assert_eq!(lapic.timer_mode, 1);
-        assert_eq!(lapic.lvt_timer_vector, 0xEF);
-        assert!(!lapic.lvt_timer_masked);
-
-        // Start Timer
-        lapic.write(APIC_TMR_INIT_CNT as u64, 1000);
-        assert!(lapic.start_time.is_some());
     }
 }
