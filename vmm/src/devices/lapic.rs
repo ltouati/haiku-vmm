@@ -1,166 +1,173 @@
-use log::debug;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use vm_device::MutDeviceMmio;
+use vm_device::bus::MmioAddress;
 
+// LAPIC Register Offsets
+pub const APIC_ID: u64 = 0x20;
+pub const APIC_VER: u64 = 0x30;
+pub const APIC_TPR: u64 = 0x80;
+pub const APIC_EOI: u64 = 0xB0;
+pub const APIC_LDR: u64 = 0xD0;
+pub const APIC_DFR: u64 = 0xE0;
+pub const APIC_SPIV: u64 = 0xF0;
+pub const APIC_ICR_LOW: u64 = 0x300;
+pub const APIC_ICR_HIGH: u64 = 0x310;
+pub const APIC_LVT_TIMER: u64 = 0x320;
+pub const APIC_LVT_LINT0: u64 = 0x350;
+pub const APIC_LVT_LINT1: u64 = 0x360;
+pub const APIC_LVT_ERROR: u64 = 0x370;
+pub const APIC_TMICT: u64 = 0x380; // Initial Count
+pub const APIC_TMCCT: u64 = 0x390; // Current Count
+pub const APIC_TDCR: u64 = 0x3E0; // Divide Configuration
+
+// Base Address (Default)
 pub const APIC_BASE: u64 = 0xFEE00000;
-pub const APIC_SIZE: u64 = 0x1000; // 4KB
 
-// APIC Register Offsets
-const _APIC_ID: u32 = 0x020;
-const APIC_VER: u32 = 0x030;
-const _APIC_TPR: u32 = 0x080;
-const APIC_EOI: u32 = 0x0B0;
-const _APIC_LDR: u32 = 0x0D0;
-const _APIC_DFR: u32 = 0x0E0;
-const APIC_SVR: u32 = 0x0F0;
-const _APIC_ESR: u32 = 0x280;
-const APIC_ICR_LOW: u32 = 0x300;
-const _APIC_ICR_HIGH: u32 = 0x310;
-const APIC_LVT_TIMER: u32 = 0x320;
-const APIC_LVT_LINT0: u32 = 0x350;
-const APIC_LVT_LINT1: u32 = 0x360;
-const APIC_LVT_ERROR: u32 = 0x370;
-const APIC_TMR_INIT_CNT: u32 = 0x380;
-const APIC_TMR_CUR_CNT: u32 = 0x390;
-const APIC_TMR_DIV: u32 = 0x3E0;
+// Timer Modes (Bits 17:18 in LVT Timer)
+pub const APIC_LVT_TIMER_ONESHOT: u32 = 0 << 17;
+pub const APIC_LVT_TIMER_PERIODIC: u32 = 1 << 17;
+pub const APIC_LVT_TIMER_TSCDEADLINE: u32 = 2 << 17;
+
+const LAPIC_FREQ_HZ: u64 = 1_000_000_000; // 1 GHz base for simplicity / calculation
 
 pub struct Lapic {
-    regs: [u32; 1024], // 4KB space, accessed as 32-bit registers
-    // Timer State
-    initial_count: u32,
-    divide_conf: u32,
-    start_time: Option<Instant>,
-    timer_mode: u8, // 0=OneShot, 1=Periodic
-    lvt_timer_vector: u8,
-    lvt_timer_masked: bool,
+    regs: [u32; 1024], // 4KB space, 4-byte registers
+    timer_last_update: Instant,
+    timer_target_expires: Option<Instant>,
+    timer_period: Option<Duration>,
 }
-
 impl Default for Lapic {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl Lapic {
     pub fn new() -> Self {
         let mut lapic = Lapic {
             regs: [0; 1024],
-            initial_count: 0,
-            divide_conf: 0,
-            start_time: None,
-            timer_mode: 0,
-            lvt_timer_vector: 0,
-            lvt_timer_masked: true,
+            timer_last_update: Instant::now(),
+            timer_target_expires: None,
+            timer_period: None,
         };
         lapic.reset();
         lapic
     }
 
     pub fn reset(&mut self) {
-        // Set default values (simplified)
-        self.write_reg(APIC_VER, 0x50014); // Version 0x14, Max LVT 5
-        self.write_reg(APIC_SVR, 0xFF); // Spurious Vector Reg (enabled)
-        self.write_reg(APIC_LVT_LINT0, 0x10000); // Masked
-        self.write_reg(APIC_LVT_LINT1, 0x10000); // Masked
-        self.write_reg(APIC_LVT_ERROR, 0x10000); // Masked
-        self.write_reg(APIC_LVT_TIMER, 0x10000); // Masked
-        self.write_reg(APIC_TMR_DIV, 0xB); // Divide by 1
-
-        self.initial_count = 0;
-        self.divide_conf = 0xB;
-        self.start_time = None;
-        self.lvt_timer_masked = true;
+        // default values
+        self.regs[(APIC_VER / 4) as usize] = 0x50014; // Version 0x14, Max LVT 5
+        self.regs[(APIC_SPIV / 4) as usize] = 0xFF; // Spurious Interrupt Vector (enabled)
+        // Mask LVTs
+        self.regs[(APIC_LVT_TIMER / 4) as usize] = 0x10000;
+        self.regs[(APIC_LVT_LINT0 / 4) as usize] = 0x10000;
+        self.regs[(APIC_LVT_LINT1 / 4) as usize] = 0x10000;
+        self.regs[(APIC_LVT_ERROR / 4) as usize] = 0x10000;
+        self.regs[(APIC_TMICT / 4) as usize] = 0;
+        self.regs[(APIC_TMCCT / 4) as usize] = 0;
+        self.regs[(APIC_TDCR / 4) as usize] = 0xB; // Divide by 1 (or whatever default)
     }
 
-    fn read_reg(&self, offset: u32) -> u32 {
-        let index = (offset / 4) as usize;
+    fn read_reg(&self, offset: u64) -> u32 {
+        let idx = (offset / 4) as usize;
+        if idx >= self.regs.len() {
+            return 0;
+        }
+        // Special handling for Current Count (TMCCT)
+        if offset == APIC_TMCCT {
+            return self.get_current_count();
+        }
+        self.regs[idx]
+    }
+
+    fn write_reg(&mut self, offset: u64, val: u32) {
+        let idx = (offset / 4) as usize;
+        if idx >= self.regs.len() {
+            return;
+        }
+
+        // log::debug!("LAPIC Write: Offset {:#x}, Val {:#x}", offset, val);
+
         match offset {
-            APIC_TMR_CUR_CNT => self.get_current_count(),
+            APIC_TMICT => {
+                // log::info!("LAPIC Timer Initial Count Set: {}", val);
+                self.regs[idx] = val;
+                self.update_timer(val);
+            }
+            APIC_LVT_TIMER => {
+                // log::info!("LAPIC LVT Timer Set: {:#x}", val);
+                self.regs[idx] = val;
+            }
+            APIC_SPIV => {
+                // log::info!("LAPIC SPIV Set: {:#x}", val);
+                self.regs[idx] = val;
+            }
             _ => {
-                if index < self.regs.len() {
-                    self.regs[index]
-                } else {
-                    0
-                }
+                self.regs[idx] = val;
             }
         }
     }
 
-    fn write_reg(&mut self, offset: u32, val: u32) {
-        let index = (offset / 4) as usize;
-        if index < self.regs.len() {
-            self.regs[index] = val;
-        }
-    }
-
-    fn get_divide_value(&self) -> u32 {
-        let val = self.divide_conf & 0xB; // Bits 0,1,3. Bit 2 is always 0.
-        match val {
-            0x0 => 2,
-            0x1 => 4,
-            0x2 => 8,
-            0x3 => 16,
-            0x8 => 32,
-            0x9 => 64,
-            0xA => 128,
-            0xB => 1,
-            _ => 1,
-        }
-    }
-
     fn get_current_count(&self) -> u32 {
-        if let Some(start) = self.start_time {
-            let elapsed_ns = start.elapsed().as_nanos() as u64;
-            // 100MHz Frequency (10ns period)
-            let freq_hz = 100_000_000;
-            let divide = self.get_divide_value() as u64;
-
-            let ticks = (elapsed_ns * freq_hz / 1_000_000_000) / divide;
-
-            if ticks >= self.initial_count as u64 {
-                if self.timer_mode == 1 {
-                    // Periodic
-                    let rem = ticks % (self.initial_count as u64);
-                    return self.initial_count - (rem as u32);
-                }
+        if let Some(expires) = self.timer_target_expires {
+            let now = Instant::now();
+            if now >= expires {
                 return 0;
             } else {
-                return self.initial_count - (ticks as u32);
+                let remaining = expires - now;
+                let ticks = (remaining.as_nanos() as u64 * LAPIC_FREQ_HZ) / 1_000_000_000;
+                return ticks as u32;
             }
         }
         0
     }
 
-    // Check if interrupt pending (No state change)
-    #[allow(clippy::collapsible_if)]
-    pub fn peek_timer(&self) -> Option<u8> {
-        if self.lvt_timer_masked || self.initial_count == 0 {
-            return None;
+    fn update_timer(&mut self, initial_count: u32) {
+        if initial_count == 0 {
+            self.timer_target_expires = None;
+            self.timer_period = None;
+            return;
         }
-        if let Some(start) = self.start_time {
-            if start.elapsed().as_millis() > 10 && self.timer_mode == 1 {
-                return Some(self.lvt_timer_vector);
-            }
-        }
-        None
+        // Period = (Initial * Divide) / Frequency
+        // Assuming divide = 1 for simplicity
+        let nanos = (initial_count as u64 * 1_000_000_000) / LAPIC_FREQ_HZ;
+        let period = Duration::from_nanos(nanos);
+
+        // log::info!("LAPIC Timer Armed: Period = {:?}", period);
+
+        self.timer_period = Some(period);
+        self.timer_target_expires = Some(Instant::now() + period);
+        self.timer_last_update = Instant::now();
     }
 
-    // Check if interrupt pending (Consumes current tick)
+    pub fn peek_timer(&self) -> Option<Instant> {
+        self.timer_target_expires
+    }
+
     pub fn check_timer(&mut self) -> Option<u8> {
-        if self.lvt_timer_masked || self.initial_count == 0 {
-            return None;
-        }
-
-        if let Some(start) = self.start_time {
-            // 100Hz Check Frequency? (10ms)
-            // We return interrupt if enough time passed to warrant a tick.
-            // This is simplified. KVM usually uses a dedicated thread or hrtimer.
-            // We rely on the VMM loop calling this frequently.
-
-            if start.elapsed().as_millis() > 10 && self.timer_mode == 1 {
-                self.start_time = Some(Instant::now()); // Restart cycle
-                return Some(self.lvt_timer_vector);
+        if let Some(expires) = self.timer_target_expires
+            && Instant::now() >= expires
+        {
+            // Timer Expired!
+            let lvt_timer = self.regs[(APIC_LVT_TIMER / 4) as usize];
+            if (lvt_timer & 0x10000) != 0 {
+                return None; // Masked
             }
+
+            let vector = (lvt_timer & 0xFF) as u8;
+            // log::debug!("LAPIC Timer Expired! Vector: {}", vector);
+
+            let mode = lvt_timer & (3 << 17);
+            if mode == APIC_LVT_TIMER_PERIODIC {
+                if let Some(period) = self.timer_period {
+                    self.timer_target_expires = Some(Instant::now() + period);
+                }
+            } else {
+                self.timer_target_expires = None;
+            }
+
+            return Some(vector);
         }
+
         None
     }
 

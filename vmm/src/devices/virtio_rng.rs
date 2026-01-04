@@ -73,6 +73,8 @@ impl RngDevice {
 
         let mut needs_interrupt = false;
 
+        log::debug!("RNG: Processing Queue");
+
         while let Some(mut chain) = queue
             .iter(mem)
             .map_err(|e| {
@@ -83,10 +85,10 @@ impl RngDevice {
             .and_then(|mut i| i.next())
         {
             let mut total_written = 0;
-            let mut buf = [0u8; 64];
+            // Use 4KB buffer (Page Size) for performance
+            let mut buf = [0u8; 4096];
 
             for desc in chain.by_ref() {
-                // Fix: Cast VRING_DESC_F_WRITE to u16
                 if (desc.flags() & virtio_bindings::virtio_ring::VRING_DESC_F_WRITE as u16) == 0 {
                     continue;
                 }
@@ -96,10 +98,18 @@ impl RngDevice {
 
                 while desc_offset < desc_len {
                     let chunk_len = std::cmp::min(desc_len - desc_offset, buf.len());
+                    // log::debug!("RNG: Reading {} bytes...", chunk_len);
                     match self.rng_source.read(&mut buf[..chunk_len]) {
-                        Ok(n) if n > 0 => {
-                            // Fix: checked_add provided by Address trait
-                            let addr = desc.addr().checked_add(desc_offset as u64).unwrap();
+                        Ok(0) => {
+                            log::warn!("RNG: Read 0 bytes (EOF/Block)");
+                            break;
+                        }
+                        Ok(n) => {
+                            // log::debug!("RNG: Read {} bytes.", n);
+                            let addr = desc
+                                .addr()
+                                .checked_add(desc_offset as u64)
+                                .ok_or_else(|| anyhow::anyhow!("Descriptor address overflow"))?;
                             match mem.write_slice(&buf[..n], addr) {
                                 Ok(_) => {
                                     total_written += n;
@@ -111,31 +121,43 @@ impl RngDevice {
                                 }
                             }
                         }
-                        _ => break,
+                        Err(e) => {
+                            log::error!("RNG Source Read Error: {:?}", e);
+                            break;
+                        }
                     }
                 }
             }
 
             if total_written > 0 {
-                // Fix: add_used needs mem
+                log::debug!("RNG: Adding Used len={}", total_written);
                 queue
                     .add_used(mem, chain.head_index(), total_written as u32)
-                    .unwrap();
-                
+                    .map_err(|e| anyhow::anyhow!("Failed to add used buffer: {:?}", e))?;
+
                 if queue.needs_notification(mem).unwrap_or(true) {
                     needs_interrupt = true;
                 }
             }
         }
 
+        if needs_interrupt {
+            log::debug!("RNG: Signaling Interrupt");
+            self.config
+                .interrupt_status
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+            if let (Some(_injector), Some(pic)) = (self.injector.as_mut(), &self.pic) {
+                let mut pic_lock = pic
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("PIC lock poisoned"))?;
+                pic_lock.set_irq(self.irq_line, true);
+                // Do NOT de-assert here. Wait for Guest ACK (Offset 0x64).
+            }
+        }
+
         Ok(needs_interrupt)
     }
 }
-
-// Fix: Implement MutDeviceMmio for Mutex<RngDevice>
-// Note: rust-vmm `vm-device` expects the implementation on the device struct itself if using `register_mmio`.
-// Wait, `linux.rs` wraps it in `Arc<Mutex<T>>`. `register_mmio` takes `Arc<Mutex<dyn MutDeviceMmio>>`.
-// So `RngDevice` must implement `MutDeviceMmio`.
 
 impl MutDeviceMmio for RngDevice {
     fn mmio_read(&mut self, _base: vm_device::bus::MmioAddress, offset: u64, data: &mut [u8]) {
@@ -144,18 +166,29 @@ impl MutDeviceMmio for RngDevice {
 
     fn mmio_write(&mut self, _base: vm_device::bus::MmioAddress, offset: u64, data: &[u8]) {
         self.write(offset, data);
-        if offset == 0x64 { // Interrupt ACK
-             let ack = if data.len() == 4 {
-                u32::from_le_bytes(data.try_into().unwrap())
+        if offset == 0x64 {
+            // Interrupt ACK
+            log::debug!("RNG: Ack Received");
+            let ack = if data.len() == 4 {
+                u32::from_le_bytes(
+                    data.try_into()
+                        .map_err(|_| anyhow::anyhow!("Invalid data len"))
+                        .unwrap_or([0u8; 4]),
+                )
             } else {
                 data[0] as u32
             };
-            self.config.interrupt_status.fetch_and(!(ack as u8), std::sync::atomic::Ordering::SeqCst);
-             let current = self.config.interrupt_status.load(std::sync::atomic::Ordering::SeqCst);
-            if current == 0 {
-                 if let Some(pic) = &self.pic {
-                    pic.lock().unwrap().set_irq(self.irq_line, false);
-                }
+            self.config
+                .interrupt_status
+                .fetch_and(!(ack as u8), std::sync::atomic::Ordering::SeqCst);
+            let current = self
+                .config
+                .interrupt_status
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if current == 0
+                && let Some(mut p) = self.pic.as_ref().and_then(|p| p.lock().ok())
+            {
+                p.set_irq(self.irq_line, false)
             }
         }
     }
@@ -198,18 +231,18 @@ impl VirtioMmioDevice for RngDevice {
         match self.process_queue() {
             Ok(needs_irq) => {
                 if needs_irq {
-                    self.config.interrupt_status.store(1, std::sync::atomic::Ordering::SeqCst);
-
-                    if let (Some(_injector), Some(pic)) = (self.injector.as_mut(), &self.pic) {
-                        let mut pic_lock = pic.lock().unwrap();
-                        pic_lock.set_irq(self.irq_line, true);
-                        pic_lock.set_irq(self.irq_line, false);
-                        // let _ = injector.inject_interrupt(self.irq_line); // Handled by PIC Polling
+                    log::debug!("RNG: Signaling Interrupt");
+                    self.config
+                        .interrupt_status
+                        .store(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(mut lock) = self.pic.as_ref().and_then(|p| p.lock().ok()) {
+                        lock.set_irq(self.irq_line, true)
                     }
+                    // Do NOT de-assert here. Wait for Guest ACK (Offset 0x64).
+                    // This supports both Edge (0->1) and Level (Held High) triggering.
                 }
             }
             Err(e) => log::error!("RNG queue processing error: {:?}", e),
         }
     }
-
 }

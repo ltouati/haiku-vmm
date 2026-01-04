@@ -166,7 +166,7 @@ impl VirtioMmioDevice for BlockDevice {
                 p.set_irq(self.irq_line, true);
                 p.set_irq(self.irq_line, false);
             }
-            
+
             // Manual Injection Removed - Handled by PIC Polling
             /* if let Some(inj) = &mut self.injector {
                 let _ = inj.inject_interrupt(self.irq_line as u8);

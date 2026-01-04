@@ -132,6 +132,28 @@ impl MutDevicePio for I8042Wrapper {
                         self.cmd = val;
                         debug!("I8042: CMD_WRITE_OUTP (Expect Data)");
                     }
+                    0xA7 => {
+                        // Disable AUX
+                        self.control |= 0x20;
+                        debug!("I8042: Disable AUX");
+                    }
+                    0xA8 => {
+                        // Enable AUX
+                        self.control &= !0x20;
+                        debug!("I8042: Enable AUX");
+                    }
+                    0xAA => {
+                        // Self Test
+                        self.flush_buf();
+                        self.push_byte(0x55); // Passed
+                        debug!("I8042: Self Test -> 0x55");
+                    }
+                    0xAB => {
+                        // Interface Test
+                        self.flush_buf();
+                        self.push_byte(0x00); // OK
+                        debug!("I8042: Interface Test -> 0x00");
+                    }
                     _ => {
                         debug!("I8042: Unknown/Ignored Command {:#x}", val);
                     }

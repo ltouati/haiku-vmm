@@ -13,11 +13,11 @@ use linux_loader::{
 use log::{debug, error, info};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
+use crate::devices::cmos::Cmos;
 use crate::devices::i8042::I8042Wrapper;
 use crate::devices::lapic::{self, Lapic};
 use crate::devices::pic::Pic;
 use crate::devices::pit::Pit;
-use crate::devices::rtc::RtcWrapper;
 use crate::devices::serial::SerialConsole;
 
 use crate::devices::virtio_blk::BlockDevice;
@@ -57,11 +57,11 @@ const VIRTIO_BLK_IRQ: u32 = 5;
 
 // VirtIO RNG Defaults
 const VIRTIO_RNG_ADDR: u64 = 0xd0001000; // 4K after Block
-const VIRTIO_RNG_IRQ: u32 = 10;
+const VIRTIO_RNG_IRQ: u32 = 11; // Swapped with Console
 
 // VirtIO Console Defaults
 const VIRTIO_CONSOLE_ADDR: u64 = 0xd0002000; // 4K after RNG
-const VIRTIO_CONSOLE_IRQ: u32 = 11;
+const VIRTIO_CONSOLE_IRQ: u32 = 10; // Swapped with RNG
 
 #[derive(Clone)]
 struct VirtioMmioConfig {
@@ -305,6 +305,10 @@ impl Linux64Guest {
         add_e820_entry(&mut params, 0, 0x9fc00, 1);
         add_e820_entry(&mut params, HIMEM_START, mem_size - HIMEM_START, 1);
 
+        // Write MP Table at 0x9FC00 (Top of base memory)
+        crate::os::mptable::write_mp_table(guest_mem, 0x9FC00, 1)
+            .map_err(|e| io::Error::other(format!("Failed to write MP Table: {:?}", e)))?;
+
         LinuxBootConfigurator::write_bootparams(
             &BootParams::new(&params, GuestAddress(ZERO_PAGE_START)),
             guest_mem,
@@ -362,8 +366,8 @@ impl Linux64Guest {
         state.segs[regs::SEG_DS] = data_seg;
         state.segs[regs::SEG_ES] = data_seg;
         state.segs[regs::SEG_SS] = data_seg;
-        state.segs[regs::SEG_FS] = data_seg;
-        state.segs[regs::SEG_GS] = data_seg;
+        state.segs[regs::SEG_FS] = sys::NvmmX64StateSeg::default();
+        state.segs[regs::SEG_GS] = sys::NvmmX64StateSeg::default();
         state.segs[regs::SEG_TR] = tss_seg;
 
         // GDT Table (Long Mode)
@@ -424,42 +428,94 @@ impl Linux64Guest {
     ) -> anyhow::Result<()> {
         info!("Starting VCPU...");
 
-        // Disable XSAVE (26), OSXSAVE (27), AVX (28), F16C (29) in ECX of Leaf 1
+        // CPUID Leaf 0x0: Vendor Information
+        // EAX: Maximum Input Value for Basic CPUID Information (set to 0x16 for our 0x15/0x16 leaves)
+        // EBX: "Genu"
+        // ECX: "ntel"
+        // EDX: "ineI"
+        // Force "GenuineIntel" to ensure kernel uses Intel TSC calibration paths (CPUID 0x15)
+        let leaf0_eax = 0x16;
+        let leaf0_ebx = 0x756e6547; // "Genu"
+        let leaf0_edx = 0x49656e69; // "ineI"
+        let leaf0_ecx = 0x6c65746e; // "ntel"
+
         vcpu.configure_cpuid(
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29),
-            0,
+            0, leaf0_eax, leaf0_ebx, leaf0_ecx, leaf0_edx, !leaf0_eax, !leaf0_ebx, !leaf0_ecx,
+            !leaf0_edx,
+        )?;
+
+        // CPUID Leaf 0x1: Version and Features
+        // We restore the "Haswell" fake values but with correct MASKS.
+        // Set:  Value we want.
+        // Del:  !Value (Anything we don't set to 1, we force to 0).
+        let leaf1_eax = 0x000306C3;
+        let leaf1_ebx = 0x00000800; // Brand 0, CLFLUSH 8, APIC 0
+        // ECX: Disable x2APIC (Bit 21) to force MMIO usage (0xFEE00000).
+        // Old: 0x80202001 -> New: 0x80002001
+        let leaf1_ecx = 0x80002001;
+        let leaf1_edx = 0x078BFBFD;
+
+        vcpu.configure_cpuid(
+            1, leaf1_eax, leaf1_ebx, leaf1_ecx, leaf1_edx, !leaf1_eax, !leaf1_ebx, !leaf1_ecx,
+            !leaf1_edx,
+        )?;
+
+        // CPUID Leaf 0x6: Thermal/Power Management
+        // We REMOVE this because enabling ARAT (Bit 2) implies TSC Deadline support
+        // which NVMM does not implement (MSR 0x6E0 is not handled).
+        // This likely caused the hang after TSC calibration.
+        // We force EAX=0 to disable ARAT.
+        vcpu.configure_cpuid(
+            6, 0, 0, 0, 0, !0, !0, !0, !0, // Force clear all
+        )?;
+
+        // Disable FSGSBASE (Leaf 7, Subleaf 0, EBX Bit 0)
+        vcpu.configure_cpuid(
+            7, 0, 0, 0, 0, 0, 1, // Del EBX bit 0
+            0, 0,
         )?;
 
         // Advertise KVM Signature
-        // Leaf 0x40000000:
-        // EAX: MAXIMUM LEAF (0x40000001)
-        // EBX: "KVMK", ECX: "VMKV", EDX: "M\0\0\0"
-        // Wait, standard KVM signature is:
-        // EBX: 0x4b4d564b ("KVMK"), ECX: 0x564b4d56 ("VMKV"), EDX: 0x4d ("M")
-        // Correct order for "KVMKVMKVM\0\0\0"
+        // Leaf 0x40000000
+        let kvm_sig_ebx = 0x4b4d_564b;
+        let kvm_sig_ecx = 0x564b_4d56;
+        let kvm_sig_edx = 0x0000_004d;
+
         vcpu.configure_cpuid(
             0x4000_0000,
             0x4000_0001,
-            0x4b4d_564b,
-            0x564b_4d56,
-            0x0000_004d,
-            0,
-            0,
-            0,
-            0,
+            kvm_sig_ebx,
+            kvm_sig_ecx,
+            kvm_sig_edx,
+            !0x4000_0001, // Del EAX
+            !kvm_sig_ebx, // Del EBX
+            !kvm_sig_ecx, // Del ECX
+            !kvm_sig_edx, // Del EDX
         )?;
 
-        // Advertise KVM Features (Clocksource)
-        // Leaf 0x40000001:
-        // EAX: bit 0 (KVM_FEATURE_CLOCKSOURCE), bit 3 (KVM_FEATURE_CLOCKSOURCE2)
-        vcpu.configure_cpuid(0x4000_0001, 0x1 | 0x8, 0, 0, 0, 0, 0, 0, 0)?;
+        // Disable KVM Features (Leaf 0x40000001)
+        // Force all to 0. Set=0, Del=!0 (0xFFFFFFFF)
+        vcpu.configure_cpuid(0x4000_0001, 0, 0, 0, 0, !0, !0, !0, !0)?;
+
+        // CPUID Leaf 0x15: Time Stamp Counter and Core Crystal Clock Information
+        // Force values: EAX=1, EBX=1, ECX=3000000000
+        let tsc_eax = 1;
+        let tsc_ebx = 1;
+        let tsc_ecx = 3_000_000_000;
+
+        vcpu.configure_cpuid(
+            0x15, tsc_eax, tsc_ebx, tsc_ecx, 0, !tsc_eax, !tsc_ebx, !tsc_ecx, !0,
+        )?;
+
+        // CPUID Leaf 0x16: Processor Frequency Information
+        // Force values: EAX=3000, EBX=3000, ECX=100
+        let freq_eax = 3000;
+        let freq_ebx = 3000;
+        let freq_ecx = 100;
+
+        vcpu.configure_cpuid(
+            0x16, freq_eax, freq_ebx, freq_ecx, 0, !freq_eax, !freq_ebx, !freq_ecx, !0,
+        )?;
 
         // Initialize PICs (Moved up for Serial Dependency)
         // Initialize PIC (Unified)
@@ -469,7 +525,10 @@ impl Linux64Guest {
         let pit = Arc::new(Mutex::new(Pit::new()));
         let serial = Arc::new(Mutex::new(SerialConsole::new(Some(pic.clone()))));
 
-        let rtc = Arc::new(Mutex::new(RtcWrapper::new()));
+        // CMOS/RTC with real time and memory size info
+        let mem_below_4g = 512 * 1024 * 1024; // 512 MB
+        let mem_above_4g = 0;
+        let cmos = Arc::new(Mutex::new(Cmos::new(mem_below_4g, mem_above_4g)));
         let lapic = Arc::new(Mutex::new(Lapic::new()));
 
         let debug_port = Arc::new(Mutex::new(DebugPort));
@@ -514,9 +573,9 @@ impl Linux64Guest {
                 .register_pio(
                     PioRange::new(PioAddress(0x70), 2)
                         .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
-                    rtc.clone(),
+                    cmos.clone(),
                 )
-                .context("RTC")?;
+                .context("CMOS")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x80), 0x10)
@@ -901,6 +960,80 @@ impl Linux64Guest {
                          return Ok(VmAction::SetRip(npc));
                     }
 
+                    // FS_BASE (0xC0000100)
+                    if msr == 0xC0000100 {
+                        let mut state = injector.get_state(sys::NVMM_X64_STATE_SEGS)
+                            .map_err(|e| anyhow!("Failed to get SEGS: {}", e))?;
+                        if is_write {
+                            info!("Setting FS_BASE to {:#x}", val);
+                            state.segs[sys::NVMM_X64_SEG_FS].base = val;
+                            injector.set_state(&state, sys::NVMM_X64_STATE_SEGS)
+                                .map_err(|e| anyhow!("Failed to set FS_BASE: {}", e))?;
+                        } else {
+                            // TODO: Read
+                        }
+                         return Ok(VmAction::SetRip(npc));
+                    }
+                    // GS_BASE (0xC0000101)
+                    if msr == 0xC0000101 {
+                        let mut state = injector.get_state(sys::NVMM_X64_STATE_SEGS)
+                            .map_err(|e| anyhow!("Failed to get SEGS: {}", e))?;
+                        if is_write {
+                            state.segs[sys::NVMM_X64_SEG_GS].base = val;
+                            injector.set_state(&state, sys::NVMM_X64_STATE_SEGS)
+                                .map_err(|e| anyhow!("Failed to set GS_BASE: {}", e))?;
+                        }
+                         return Ok(VmAction::SetRip(npc));
+                    }
+
+                    // KERNEL_GS_BASE (0xC0000102) -> MSR Index 5
+                    if msr == 0xC0000102 {
+                        let mut state = injector.get_state(sys::NVMM_X64_STATE_MSRS)
+                            .map_err(|e| anyhow!("Failed to get MSRS: {}", e))?;
+                        if is_write {
+                            state.msrs[5] = val;
+                            injector.set_state(&state, sys::NVMM_X64_STATE_MSRS)
+                                .map_err(|e| anyhow!("Failed to set KERNEL_GS_BASE: {}", e))?;
+                        }
+                         return Ok(VmAction::SetRip(npc));
+                    }
+
+                     // STAR (0xC0000081) -> MSR Index 1
+                    if msr == 0xC0000081 {
+                         let mut state = injector.get_state(sys::NVMM_X64_STATE_MSRS)
+                            .map_err(|e| anyhow!("Failed to get MSRS: {}", e))?;
+                        if is_write {
+                            state.msrs[1] = val;
+                            injector.set_state(&state, sys::NVMM_X64_STATE_MSRS)
+                                .map_err(|e| anyhow!("Failed to set STAR: {}", e))?;
+                        }
+                         return Ok(VmAction::SetRip(npc));
+                    }
+
+                    // LSTAR (0xC0000082) -> MSR Index 2
+                    if msr == 0xC0000082 {
+                         let mut state = injector.get_state(sys::NVMM_X64_STATE_MSRS)
+                            .map_err(|e| anyhow!("Failed to get MSRS: {}", e))?;
+                        if is_write {
+                            debug!("Setting LSTAR to {:#x}", val);
+                            state.msrs[2] = val;
+                            injector.set_state(&state, sys::NVMM_X64_STATE_MSRS)
+                                .map_err(|e| anyhow!("Failed to set LSTAR: {}", e))?;
+                        }
+                         return Ok(VmAction::SetRip(npc));
+                    }
+
+                     // SFMASK (0xC0000084) -> MSR Index 4
+                    if msr == 0xC0000084 {
+                         let mut state = injector.get_state(sys::NVMM_X64_STATE_MSRS)
+                            .map_err(|e| anyhow!("Failed to get MSRS: {}", e))?;
+                        if is_write {
+                            state.msrs[4] = val;
+                            injector.set_state(&state, sys::NVMM_X64_STATE_MSRS)
+                                .map_err(|e| anyhow!("Failed to set SFMASK: {}", e))?;
+                        }
+                         return Ok(VmAction::SetRip(npc));
+                    }
                     debug!("Handling MSR Exit: msr={:#x}, is_write={}, val={:#x}", msr, is_write, val);
                     if !is_write {
                         // Return 0
@@ -927,18 +1060,20 @@ impl Linux64Guest {
                     #[allow(clippy::collapsible_if)]
                     if timer_peek.is_some() || pic_pending.is_some() {
                         if let Ok(true) = injector.interrupts_enabled() {
-                            // LAPIC Timer (Consume)
-                            #[allow(clippy::collapsible_if)]
-                            if timer_peek.is_some() {
-                                if let Some(vector) = lapic.lock().expect("Poisoned").check_timer() {
-                                    let _ = injector.inject_interrupt(vector);
-                                }
-                            }
-                            // PIC (Consume if still pending)
-                            #[allow(clippy::collapsible_if)]
+                            // Priority: PIC (I/O) > Timer to ensure responsiveness.
+                            // We must NOT inject two interrupts in one cycle as the second overwrites the first.
+                            // 1. Check PIC
                             if pic_pending.is_some() {
                                 if let Some(vector) = pic.lock().expect("Poisoned").get_external_interrupt() {
                                     let _ = injector.inject_interrupt(vector);
+                                }
+                            } else {
+                                // 2. Check Timer (Only if PIC didn't inject)
+                                #[allow(clippy::collapsible_if)]
+                                if timer_peek.is_some() {
+                                    if let Some(vector) = lapic.lock().expect("Poisoned").check_timer() {
+                                        let _ = injector.inject_interrupt(vector);
+                                    }
                                 }
                             }
                         }
