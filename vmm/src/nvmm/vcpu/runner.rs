@@ -54,34 +54,24 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
             Box::pin(async move {
                 if !is_in {
                     // Write
-                    device_mgr
+                    // Write
+                    // Ignore errors (e.g. unmapped ports)
+                    let _ = device_mgr
                         .lock()
                         .map_err(|_| anyhow!("Failed to lock device manager"))?
-                        .pio_write(vm_device::bus::PioAddress(port), &data)
-                        .map_err(|e| {
-                            anyhow!(
-                                "PIO Write Error: port={:#x}, data={:?}, error={:?}",
-                                port,
-                                data,
-                                e
-                            )
-                        })?;
+                        .pio_write(vm_device::bus::PioAddress(port), &data);
+
                     Ok(VmAction::SetRip(npc))
                 } else {
                     // Read
-                    let mut read_data = vec![0u8; op_size as usize];
-                    device_mgr
+                    // Default to 0xFF (Unmapped)
+                    let mut read_data = vec![0xffu8; op_size as usize];
+
+                    // Attempt read, ignore errors
+                    let _ = device_mgr
                         .lock()
                         .map_err(|_| anyhow!("Failed to lock device manager"))?
-                        .pio_read(vm_device::bus::PioAddress(port), &mut read_data)
-                        .map_err(|e| {
-                            anyhow!(
-                                "PIO Read Error: port={:#x}, size={}, error={:?}",
-                                port,
-                                op_size,
-                                e
-                            )
-                        })?;
+                        .pio_read(vm_device::bus::PioAddress(port), &mut read_data);
 
                     let mut val = 0u64;
                     for (i, byte) in read_data.iter().enumerate() {
