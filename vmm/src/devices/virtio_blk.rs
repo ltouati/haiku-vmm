@@ -42,7 +42,7 @@ impl BlockDevice {
         // Populate Config Space
         let config = virtio_blk_config {
             capacity: capacity_sectors.to_le(),
-            seg_max: 1024u32.to_le(),
+            seg_max: 254u32.to_le(),
             blk_size: 512u32.to_le(),
             num_queues: 1u16.to_le(),
             ..Default::default()
