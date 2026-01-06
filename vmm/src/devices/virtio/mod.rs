@@ -24,6 +24,7 @@ const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
 pub mod virtio_blk;
 pub mod virtio_console;
 pub mod virtio_rng;
+pub mod virtio_mmio_device;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]

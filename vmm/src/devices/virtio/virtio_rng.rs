@@ -5,11 +5,12 @@ use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
 use virtio_device::{VirtioConfig, VirtioDeviceActions, VirtioDeviceType, VirtioMmioDevice};
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 
-use vm_device::MutDeviceMmio;
+
 use vm_memory::{Address, Bytes, GuestMemoryMmap};
 
 use crate::VcpuInjector;
 use crate::devices::pic::Pic;
+use crate::devices::virtio::DeviceType;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 
@@ -113,42 +114,11 @@ impl RngDevice {
     }
 }
 
-impl MutDeviceMmio for RngDevice {
-    fn mmio_read(&mut self, _base: vm_device::bus::MmioAddress, offset: u64, data: &mut [u8]) {
-        self.read(offset, data);
-    }
 
-    fn mmio_write(&mut self, _base: vm_device::bus::MmioAddress, offset: u64, data: &[u8]) {
-        self.write(offset, data);
-        if offset == 0x64 {
-            // Interrupt ACK
-            log::debug!("RNG: Ack Received");
-            let ack = if data.len() == 4 {
-                u32::from_le_bytes(
-                    data.try_into()
-                        .map_err(|_| anyhow::anyhow!("Invalid data len"))
-                        .unwrap_or([0u8; 4]),
-                )
-            } else {
-                data[0] as u32
-            };
-            self.config
-                .interrupt_status
-                .fetch_and(!(ack as u8), std::sync::atomic::Ordering::SeqCst);
-            let current = self
-                .config
-                .interrupt_status
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if current == 0 {
-                // De-assert removed for Pulse logic (handled in notify)
-            }
-        }
-    }
-}
 
 impl VirtioDeviceType for RngDevice {
     fn device_type(&self) -> u32 {
-        4 // RNG
+        DeviceType::Rng as u32
     }
 }
 

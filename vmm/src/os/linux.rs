@@ -1,6 +1,7 @@
 use crate::devices::virtio::virtio_console::ConsoleDevice;
 use crate::devices::virtio::virtio_blk::BlockDevice;
 use crate::devices::virtio::virtio_rng::RngDevice;
+use crate::devices::virtio::virtio_mmio_device::MmioVirtioDevice;
 use anyhow::{Context, anyhow};
 use signal_hook::consts::SIGUSR1;
 use std::fs::File;
@@ -535,7 +536,7 @@ impl Linux64Guest {
         let i8042 = Arc::new(Mutex::new(I8042Wrapper::new(reset_evt.clone())));
 
         // Initialize VirtIO Console (Early for Scope)
-        let virtio_console = Arc::new(Mutex::new(ConsoleDevice::new()?));
+        let virtio_console = Arc::new(Mutex::new(MmioVirtioDevice(ConsoleDevice::new()?)));
 
         {
             let mut device_mgr = vcpu
@@ -654,7 +655,7 @@ impl Linux64Guest {
                     .write(true)
                     .open(disk_path)
                     .context("Failed to open disk image")?;
-                let virtio_blk = Arc::new(Mutex::new(BlockDevice::new(disk_file)?));
+                let virtio_blk = Arc::new(Mutex::new(MmioVirtioDevice(BlockDevice::new(disk_file)?)));
                 {
                     let mut blk = virtio_blk.lock().expect("Poisoned lock");
                     blk.set_memory(guest_mem.clone());
@@ -672,7 +673,7 @@ impl Linux64Guest {
             // Initialize VirtIO RNG
             {
                 info!("Initializing VirtIO RNG");
-                let virtio_rng = Arc::new(Mutex::new(RngDevice::new()?));
+                let virtio_rng = Arc::new(Mutex::new(MmioVirtioDevice(RngDevice::new()?)));
                 {
                     let mut rng = virtio_rng.lock().expect("Poisoned lock");
                     rng.set_memory(guest_mem.clone());

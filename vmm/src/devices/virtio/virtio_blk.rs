@@ -9,12 +9,12 @@ use virtio_blk::request::{Request, RequestType};
 use virtio_device::{VirtioConfig, VirtioDeviceActions, VirtioDeviceType, VirtioMmioDevice};
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 
-use vm_device::MutDeviceMmio;
-use vm_device::bus::MmioAddress;
+
 use vm_memory::{Bytes, GuestMemoryMmap};
 
 use crate::VcpuInjector;
 use crate::devices::pic::Pic;
+use crate::devices::virtio::DeviceType;
 use std::sync::{Arc, Mutex};
 
 /// VirtIO Block Device using rust-vmm components.
@@ -89,7 +89,7 @@ impl BlockDevice {
 
 impl VirtioDeviceType for BlockDevice {
     fn device_type(&self) -> u32 {
-        2 // Block
+        DeviceType::Block as u32
     }
 }
 
@@ -175,87 +175,7 @@ impl VirtioMmioDevice for BlockDevice {
     }
 }
 
-impl MutDeviceMmio for BlockDevice {
-    fn mmio_read(&mut self, _base: MmioAddress, offset: u64, data: &mut [u8]) {
-        self.read(offset, data);
 
-        // VIRTIO_MMIO_INTERRUPT_STATUS = 0x60
-        // Reading this register returns the interrupt status and clears it.
-        if offset == 0x60 {
-            // Read Status - Do NOT clear. Spec says Write to ACK (0x64) clears it.
-            // Just return data (already done by self.read above which copies from config space)
-            log::debug!(
-                "VirtIO Blk ISR Read. Status: {:#x}",
-                self.config
-                    .interrupt_status
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            );
-        }
-
-        log::debug!(
-            "VirtIO Blk MMIO Read: Offset {:#x}, Data {:?}, Len {}",
-            offset,
-            data,
-            data.len()
-        );
-        if offset == 0x04 && data.len() >= 4 {
-            let version = u32::from_le_bytes(data[0..4].try_into().unwrap());
-            log::debug!("VirtIO Blk Version Read: {}", version);
-        }
-    }
-
-    fn mmio_write(&mut self, _base: MmioAddress, offset: u64, data: &[u8]) {
-        log::debug!(
-            "VirtIO Blk MMIO Write: Offset {:#x}, Data {:?}, Len {}",
-            offset,
-            data,
-            data.len()
-        );
-        // Check legacy status access if possible, or just observe effects
-        self.write(offset, data);
-        if offset == 0x70 {
-            // Status update
-            log::debug!(
-                "VirtIO Blk Status Write. New Status (from config): {:#x}",
-                self.config.device_status
-            );
-        } else if offset == 0x64 {
-            // VIRTIO_MMIO_INTERRUPT_ACK = 0x64
-            // Writing a value with bits set clears the corresponding bits in the InterruptStatus register.
-            let ack = if data.len() == 4 {
-                u32::from_le_bytes(data.try_into().unwrap())
-            } else {
-                data[0] as u32 // Partial/byte write? Assume 32-bit usually.
-            };
-
-            // Clear bits
-            // fetch_and with !ack (bitwise NAND?)
-            // We want (status & !ack).
-            // atomic.fetch_and takes the value to AND with. So passed value is !ack.
-            self.config
-                .interrupt_status
-                .fetch_and(!(ack as u8), std::sync::atomic::Ordering::SeqCst);
-
-            // If status is now 0, de-assert IRQ
-            // We need to read it back OR check logic.
-            // Simplified: If ACK matches Used Ring (bit 0) or Configuration (bit 1), de-assert?
-            // Actually, if we clear the bits that CAUSED the interrupt, we should de-assert.
-            // Since we only use bit 0 (Used Buffer) mostly.
-            // Let's just Check current status.
-            let current = self
-                .config
-                .interrupt_status
-                .load(std::sync::atomic::Ordering::SeqCst);
-            #[allow(clippy::collapsible_if)]
-            if current == 0 {
-                if let Some(pic) = &self.pic {
-                    pic.lock().unwrap().set_irq(self.irq_line, false);
-                    log::debug!("VirtIO Blk IRQ {} De-asserted via ACK", self.irq_line);
-                }
-            }
-        }
-    }
-}
 
 impl BlockDevice {
     fn process_request(

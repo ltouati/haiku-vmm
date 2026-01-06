@@ -8,11 +8,12 @@ use virtio_bindings::virtio_ring::VRING_DESC_F_WRITE;
 use virtio_device::{VirtioConfig, VirtioDeviceActions, VirtioDeviceType, VirtioMmioDevice};
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 
-use vm_device::MutDeviceMmio;
+
 use vm_memory::{Address, Bytes, GuestMemoryMmap};
 
 use crate::VcpuInjector;
 use crate::devices::pic::Pic;
+use crate::devices::virtio::DeviceType;
 
 // Config layout
 #[repr(C, packed)]
@@ -232,19 +233,11 @@ impl ConsoleDevice {
     }
 }
 
-impl MutDeviceMmio for ConsoleDevice {
-    fn mmio_read(&mut self, _base: vm_device::bus::MmioAddress, offset: u64, data: &mut [u8]) {
-        self.read(offset, data);
-    }
 
-    fn mmio_write(&mut self, _base: vm_device::bus::MmioAddress, offset: u64, data: &[u8]) {
-        self.write(offset, data);
-    }
-}
 
 impl VirtioDeviceType for ConsoleDevice {
     fn device_type(&self) -> u32 {
-        3 // Console
+        DeviceType::Console as u32
     }
 }
 
