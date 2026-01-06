@@ -1,3 +1,6 @@
+use crate::devices::virtio::virtio_console::ConsoleDevice;
+use crate::devices::virtio::virtio_blk::BlockDevice;
+use crate::devices::virtio::virtio_rng::RngDevice;
 use anyhow::{Context, anyhow};
 use signal_hook::consts::SIGUSR1;
 use std::fs::File;
@@ -20,9 +23,6 @@ use crate::devices::pic::Pic;
 use crate::devices::pit::Pit;
 use crate::devices::serial::SerialConsole;
 
-use crate::devices::virtio_blk::BlockDevice;
-use crate::devices::virtio_console::ConsoleDevice;
-use crate::devices::virtio_rng::RngDevice;
 use crate::nvmm::sys;
 use crate::nvmm::vcpu::regs;
 use crate::{Machine, Vcpu, VmAction};
@@ -244,8 +244,7 @@ impl Linux64Guest {
             let size = f.metadata()?.len();
 
             let addr = GuestAddress(INITRD_START);
-            #[allow(deprecated)]
-            guest_mem.read_from(addr, &mut f, size as usize)?;
+            guest_mem.read_volatile_from(addr, &mut f, size as usize)?;
             Ok(Some((INITRD_START, size)))
         } else {
             Ok(None)

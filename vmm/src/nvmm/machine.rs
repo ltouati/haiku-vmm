@@ -6,7 +6,7 @@ use log::debug;
 use std::io;
 use std::sync::{Arc, Mutex};
 use vm_device::device_manager::IoManager;
-use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
+use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
 
 /// A Virtual Machine instance.
 pub struct Machine {

@@ -5,17 +5,4 @@ pub mod pic;
 pub mod pit;
 pub mod rtc;
 pub mod serial;
-pub mod virtio_blk;
-pub mod virtio_console;
-pub mod virtio_rng;
-
-pub use cmos::Cmos;
-pub use i8042::I8042Wrapper;
-pub use lapic::Lapic;
-pub use pic::Pic;
-pub use pit::Pit;
-pub use rtc::RtcWrapper;
-pub use serial::SerialConsole;
-pub use virtio_blk::BlockDevice;
-pub use virtio_console::ConsoleDevice;
-pub use virtio_rng::RngDevice;
+pub mod virtio;

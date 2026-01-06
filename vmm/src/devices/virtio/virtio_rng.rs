@@ -35,7 +35,7 @@ impl RngDevice {
         let mut device_features = 0u64;
         device_features |= 1 << VIRTIO_F_VERSION_1;
 
-        let rng_source = StdRng::from_entropy();
+        let rng_source = StdRng::from_os_rng();
 
         Ok(Self {
             config: VirtioConfig::new(device_features, queues, config_space),
@@ -84,10 +84,10 @@ impl RngDevice {
 
                 while desc_offset < desc_len {
                     let chunk_len = std::cmp::min(desc_len - desc_offset, buf.len());
-                    
+
                     self.rng_source.fill_bytes(&mut buf[..chunk_len]);
-                    let n = chunk_len; 
-                    
+                    let n = chunk_len;
+
                     let addr = desc.addr().checked_add(desc_offset as u64).unwrap();
                     if let Err(e) = mem.write_slice(&buf[..n], addr) {
                         log::error!("Failed to write RNG slice: {:?}", e);
@@ -102,9 +102,9 @@ impl RngDevice {
                 if let Err(e) = queue.add_used(mem, chain.head_index(), total_written as u32) {
                     log::error!("Failed to add used RNG: {:?}", e);
                 }
-                
+
                 if queue.needs_notification(mem).unwrap_or(true) {
-                     needs_interrupt = true;
+                    needs_interrupt = true;
                 }
             }
         }
@@ -139,10 +139,8 @@ impl MutDeviceMmio for RngDevice {
                 .config
                 .interrupt_status
                 .load(std::sync::atomic::Ordering::SeqCst);
-            if current == 0
-                && let Some(mut p) = self.pic.as_ref().and_then(|p| p.lock().ok())
-            {
-                p.set_irq(self.irq_line, false)
+            if current == 0 {
+                // De-assert removed for Pulse logic (handled in notify)
             }
         }
     }
@@ -185,11 +183,12 @@ impl VirtioMmioDevice for RngDevice {
         match self.process_queue() {
             Ok(needs_irq) => {
                 if needs_irq {
-                     log::debug!("RNG: Signaling Interrupt");
-                     self.config.interrupt_status.store(1, std::sync::atomic::Ordering::SeqCst);
-                     if let Some(mut lock) = self.pic.as_ref().and_then(|p| p.lock().ok()) {
-                         lock.set_irq(self.irq_line, true);
-                     }
+                    log::debug!("RNG: Signaling Interrupt");
+                    self.config.interrupt_status.store(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(mut lock) = self.pic.as_ref().and_then(|p| p.lock().ok()) {
+                        lock.set_irq(self.irq_line, true);
+                        lock.set_irq(self.irq_line, false);
+                    }
                 }
             }
             Err(e) => log::error!("RNG queue processing error: {:?}", e),
