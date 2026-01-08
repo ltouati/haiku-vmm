@@ -1,21 +1,23 @@
 use std::borrow::{Borrow, BorrowMut};
 use std::collections::VecDeque;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
 use virtio_bindings::virtio_ring::VRING_DESC_F_WRITE;
 use virtio_device::{VirtioConfig, VirtioDeviceActions, VirtioDeviceType, VirtioMmioDevice};
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 
-use vm_memory::{Address, Bytes, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestMemoryMmap};
 
 use crate::devices::pic::Pic;
 use crate::devices::virtio::{DeviceType, default_signal_interrupt};
 use crate::system::backend::HypervisorBackend;
 use crate::system::vmachine::vcpu::VcpuInjector;
 
-// Config layout
 #[repr(C, packed)]
 #[derive(Default, Clone, Copy, Debug)]
 pub struct VirtioConsoleConfig {
@@ -25,21 +27,36 @@ pub struct VirtioConsoleConfig {
     pub emerg_wr: u16,
 }
 
-/// `VirtIO` Console Device
-pub struct ConsoleDevice<B: HypervisorBackend> {
+/// TX request: data to write to stdout.
+struct TxRequest {
+    head_index: u16,
+    data: Vec<u8>,
+}
+
+enum WorkerMessage {
+    Tx(TxRequest),
+}
+
+/// Shared state for Console device.
+struct SharedState {
     config: VirtioConfig<Queue>,
     guest_mem: Option<GuestMemoryMmap>,
-    injector: Option<VcpuInjector<B>>,
     pic: Option<Arc<Mutex<Pic>>>,
     irq_line: u8,
-
-    // Buffer for input data (Host -> Guest)
     rx_buffer: VecDeque<u8>,
+}
+
+/// `VirtIO` Console Device with worker thread for TX.
+pub struct ConsoleDevice<B: HypervisorBackend> {
+    state: Arc<Mutex<SharedState>>,
+    injector: Option<VcpuInjector<B>>,
+    tx_sender: Option<Sender<WorkerMessage>>,
+    worker_thread: Option<JoinHandle<()>>,
+    worker_stop: Arc<AtomicBool>,
 }
 
 impl<B: HypervisorBackend> ConsoleDevice<B> {
     pub fn new() -> anyhow::Result<Self> {
-        // Console has 2 queues: RX (0), TX (1)
         let mut queues = Vec::new();
         queues.push(
             Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create RX queue: {e:?}"))?,
@@ -48,7 +65,6 @@ impl<B: HypervisorBackend> ConsoleDevice<B> {
             Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create TX queue: {e:?}"))?,
         );
 
-        // Config Space
         let console_config = VirtioConsoleConfig {
             cols: 80,
             rows: 24,
@@ -56,7 +72,6 @@ impl<B: HypervisorBackend> ConsoleDevice<B> {
             emerg_wr: 0,
         };
 
-        // Serialize config
         let config_space = unsafe {
             std::slice::from_raw_parts(
                 (&raw const console_config).cast::<u8>(),
@@ -65,166 +80,167 @@ impl<B: HypervisorBackend> ConsoleDevice<B> {
             .to_vec()
         };
 
-        // Features
         let mut device_features = 0u64;
         device_features |= 1 << VIRTIO_F_VERSION_1;
 
-        Ok(Self {
+        let state = SharedState {
             config: VirtioConfig::new(device_features, queues, config_space),
             guest_mem: None,
-            injector: None,
             pic: None,
             irq_line: 0,
             rx_buffer: VecDeque::new(),
+        };
+
+        Ok(Self {
+            state: Arc::new(Mutex::new(state)),
+            injector: None,
+            tx_sender: None,
+            worker_thread: None,
+            worker_stop: Arc::new(AtomicBool::new(false)),
         })
     }
 
     pub fn set_memory(&mut self, mem: GuestMemoryMmap) {
-        self.guest_mem = Some(mem);
+        self.state.lock().unwrap().guest_mem = Some(mem);
     }
 
     pub fn set_injector(&mut self, injector: VcpuInjector<B>, pic: Arc<Mutex<Pic>>, line: u8) {
         self.injector = Some(injector);
-        self.pic = Some(pic);
-        self.irq_line = line;
+        let mut state = self.state.lock().unwrap();
+        state.pic = Some(pic);
+        state.irq_line = line;
     }
 
-    /// Queue input data from Host (Stdin) to be sent to Guest
+    /// Queue input data from Host to be sent to Guest.
     pub fn queue_input(&mut self, data: &[u8]) {
-        self.rx_buffer.extend(data);
-        // Try to process RX queue immediately if buffers are available
-        match self.process_rx() {
-            Ok(true) => self.signal_interrupt(),
-            Ok(false) => {}
-            Err(e) => log::error!("Failed to process RX on input: {e:?}"),
+        let mut state = self.state.lock().unwrap();
+        state.rx_buffer.extend(data);
+        // Try to process RX immediately
+        let mem_opt = state.guest_mem.clone();
+        let pic = state.pic.clone();
+        let irq_line = state.irq_line;
+        if mem_opt.is_some_and(|mem| Self::process_rx_inner(&mut state, &mem)) {
+            default_signal_interrupt(&mut state.config, pic.as_ref(), irq_line);
         }
     }
 
-    fn signal_interrupt(&mut self) {
-        default_signal_interrupt(&mut self.config, self.pic.as_ref(), self.irq_line);
-    }
+    fn spawn_worker(&mut self) {
+        let (tx, rx) = mpsc::channel::<WorkerMessage>();
+        self.tx_sender = Some(tx);
+        self.worker_stop.store(false, Ordering::SeqCst);
 
-    // Process RX Queue (0): Host -> Guest
-    // Driver provides emptry buffers for us to fill with input data.
-    fn process_rx(&mut self) -> anyhow::Result<bool> {
-        let mem = match self.guest_mem.as_ref() {
-            Some(m) => m,
-            None => return Ok(false),
-        };
+        let state = Arc::clone(&self.state);
+        let stop_flag = Arc::clone(&self.worker_stop);
 
-        let mut used_any = false;
+        let handle = thread::spawn(move || {
+            log::info!("VirtIO Console Worker: Started");
 
-        // Scope for queue borrow
-        {
-            let queue = match self.config.queues.get_mut(0) {
-                Some(q) => q,
-                None => return Ok(false),
-            };
+            loop {
+                let Ok(msg) = rx.recv() else {
+                    log::info!("VirtIO Console Worker: Channel closed, exiting");
+                    break;
+                };
 
-            // If we have no data, we can't do anything
-            if self.rx_buffer.is_empty() {
-                return Ok(false);
-            }
-
-            while let Some(mut chain) = queue.iter(mem).ok().and_then(|mut i| i.next()) {
-                if self.rx_buffer.is_empty() {
+                if stop_flag.load(Ordering::SeqCst) {
+                    log::info!("VirtIO Console Worker: Stop flag set, exiting");
                     break;
                 }
 
-                let mut total_written = 0;
-                for desc in chain.by_ref() {
-                    // RX buffers must be writeable (Device writes to them)
-                    if (desc.flags() & VRING_DESC_F_WRITE as u16) == 0 {
-                        continue;
-                    }
+                match msg {
+                    WorkerMessage::Tx(req) => {
+                        // Write to stdout
+                        let _ = io::stdout().write_all(&req.data);
+                        let _ = io::stdout().flush();
 
-                    let mut desc_offset = 0;
-                    let desc_len = desc.len() as usize;
+                        // Update used ring (TX used.len = 0)
+                        let mut state_guard = state.lock().unwrap();
+                        let mem_opt = state_guard.guest_mem.clone();
+                        let pic = state_guard.pic.clone();
+                        let irq_line = state_guard.irq_line;
 
-                    while desc_offset < desc_len && !self.rx_buffer.is_empty() {
-                        // Pop needed bytes
-                        let needed = desc_len - desc_offset;
-                        // We can't slice VecDeque easily, so pop one by one or collect?
-                        // Optimization: drain a chunk?
-                        // Let's just pop loop for simplicity for now.
-                        let mut chunk = Vec::with_capacity(needed);
-                        for _ in 0..needed {
-                            if let Some(b) = self.rx_buffer.pop_front() {
-                                chunk.push(b);
-                            } else {
-                                break;
-                            }
-                        }
-
-                        let n = chunk.len();
-                        if n > 0 {
-                            let addr = desc.addr().checked_add(desc_offset as u64).unwrap();
-                            mem.write_slice(&chunk, addr)?;
-                            total_written += n;
-                            desc_offset += n;
+                        if mem_opt.is_some_and(|mem| {
+                            state_guard.config.queues.get_mut(1).is_some_and(|queue| {
+                                queue.add_used(&mem, req.head_index, 0).is_ok()
+                                    && queue.needs_notification(&mem).unwrap_or(true)
+                            })
+                        }) {
+                            default_signal_interrupt(
+                                &mut state_guard.config,
+                                pic.as_ref(),
+                                irq_line,
+                            );
                         }
                     }
-                }
-
-                if total_written > 0 {
-                    queue.add_used(mem, chain.head_index(), total_written as u32)?;
-                    used_any = true;
                 }
             }
-        }
 
-        Ok(used_any)
+            log::info!("VirtIO Console Worker: Exited");
+        });
+
+        self.worker_thread = Some(handle);
     }
 
-    // Process TX Queue (1): Guest -> Host
-    // Driver fills buffers with data for us to print.
-    fn process_tx(&mut self) -> anyhow::Result<bool> {
-        let mem = match self.guest_mem.as_ref() {
-            Some(m) => m,
-            None => return Ok(false),
+    fn stop_worker(&mut self) {
+        self.worker_stop.store(true, Ordering::SeqCst);
+        self.tx_sender = None;
+        if let Some(handle) = self.worker_thread.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Process RX queue synchronously.
+    fn process_rx_inner(state: &mut SharedState, mem: &GuestMemoryMmap) -> bool {
+        let queue = match state.config.queues.first_mut() {
+            Some(q) => q,
+            None => return false,
         };
 
-        let queue = match self.config.queues.get_mut(1) {
-            Some(q) => q,
-            None => return Ok(false),
-        };
+        if state.rx_buffer.is_empty() {
+            return false;
+        }
 
         let mut used_any = false;
 
-        while let Some(mut chain) = queue.iter(mem).ok().and_then(|mut i| i.next()) {
-            let mut _total_read = 0;
+        while let Some(chain) = queue.iter(mem).ok().and_then(|mut i| i.next()) {
+            if state.rx_buffer.is_empty() {
+                break;
+            }
 
-            for desc in chain.by_ref() {
-                // TX buffers are read-only for device (Device reads them)
-                if (desc.flags() & VRING_DESC_F_WRITE as u16) != 0 {
+            let head_index = chain.head_index();
+            let mut total_written = 0;
+
+            for desc in chain {
+                if (desc.flags() & VRING_DESC_F_WRITE as u16) == 0 {
                     continue;
                 }
 
-                let len = desc.len() as usize;
-                let addr = desc.addr();
+                let desc_len = desc.len() as usize;
+                let available = std::cmp::min(desc_len, state.rx_buffer.len());
+                if available == 0 {
+                    break;
+                }
 
-                let mut buf = vec![0u8; len];
-                match mem.read_slice(&mut buf, addr) {
-                    Ok(()) => {
-                        // Write to stdout
-                        let _ = io::stdout().write(&buf);
-                        let _ = io::stdout().flush();
-                        // total_read += len; unused
+                let mut chunk = Vec::with_capacity(available);
+                for _ in 0..available {
+                    if let Some(b) = state.rx_buffer.pop_front() {
+                        chunk.push(b);
+                    } else {
+                        break;
                     }
-                    Err(e) => log::error!("Failed to read TX guest mem: {e:?}"),
+                }
+
+                if !chunk.is_empty() && mem.write_slice(&chunk, desc.addr()).is_ok() {
+                    total_written += chunk.len();
                 }
             }
 
-            // Should we return used length? Usually yes, 0 for TX?
-            // VIRTIO spec: "The driver adds a descriptor chain to the receiveq... The device consumes the chain..."
-            // For TX, "The driver adds a descriptor chain to the transmitq... The device consumes the chain..."
-            // "The used.len field is set to 0." for Console TX?
-            // Checking spec: "For transmitq, used.len is 0."
-            queue.add_used(mem, chain.head_index(), 0)?;
-            used_any = true;
+            if total_written > 0 {
+                let _ = queue.add_used(mem, head_index, total_written as u32);
+                used_any = true;
+            }
         }
 
-        Ok(used_any)
+        used_any
     }
 }
 
@@ -238,45 +254,106 @@ impl<B: HypervisorBackend> VirtioDeviceActions for ConsoleDevice<B> {
     type E = anyhow::Error;
 
     fn activate(&mut self) -> anyhow::Result<()> {
-        log::debug!("VirtIO Console Activated");
+        log::debug!("VirtIO Console Activated - spawning worker");
+        self.spawn_worker();
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
-        log::debug!("VirtIO Console Reset");
-        self.rx_buffer.clear();
+        log::debug!("VirtIO Console Reset - stopping worker");
+        self.stop_worker();
+        self.state.lock().unwrap().rx_buffer.clear();
         Ok(())
     }
 }
 
 impl<B: HypervisorBackend> Borrow<VirtioConfig<Queue>> for ConsoleDevice<B> {
     fn borrow(&self) -> &VirtioConfig<Queue> {
-        &self.config
+        unsafe {
+            let guard = self.state.lock().unwrap();
+            let ptr = &raw const guard.config;
+            &*ptr
+        }
     }
 }
 
 impl<B: HypervisorBackend> BorrowMut<VirtioConfig<Queue>> for ConsoleDevice<B> {
     fn borrow_mut(&mut self) -> &mut VirtioConfig<Queue> {
-        &mut self.config
+        unsafe {
+            let mut guard = self.state.lock().unwrap();
+            let ptr = &raw mut guard.config;
+            &mut *ptr
+        }
     }
 }
 
 impl<B: HypervisorBackend> VirtioMmioDevice for ConsoleDevice<B> {
     fn queue_notify(&mut self, val: u32) {
-        println!("VirtIO Console Notify: {val}");
-        let res = match val {
-            0 => self.process_rx(),
-            1 => self.process_tx(),
-            _ => Ok(false),
+        log::debug!("VirtIO Console Notify: queue={val}");
+
+        let mut state = self.state.lock().unwrap();
+        let Some(mem) = state.guest_mem.clone() else {
+            return;
         };
-        println!("VirtIO Console Notify Result: {res:?}");
-        match res {
-            Ok(needs_irq) => {
-                if needs_irq {
-                    self.signal_interrupt();
+
+        // Extract values for interrupt signaling
+        let pic = state.pic.clone();
+        let irq_line = state.irq_line;
+
+        match val {
+            0 => {
+                // RX: Process synchronously
+                if Self::process_rx_inner(&mut state, &mem) {
+                    default_signal_interrupt(&mut state.config, pic.as_ref(), irq_line);
                 }
             }
-            Err(e) => log::error!("Console queue error: {e:?}"),
+            1 => {
+                // TX: Send to worker for async stdout writes
+                let Some(queue) = state.config.queues.get_mut(1) else {
+                    return;
+                };
+
+                while let Some(chain) = queue.iter(&mem).ok().and_then(|mut i| i.next()) {
+                    let head_index = chain.head_index();
+                    let mut data = Vec::new();
+
+                    for desc in chain {
+                        if (desc.flags() & VRING_DESC_F_WRITE as u16) != 0 {
+                            continue;
+                        }
+
+                        let len = desc.len() as usize;
+                        let mut buf = vec![0u8; len];
+                        if mem.read_slice(&mut buf, desc.addr()).is_ok() {
+                            data.extend(buf);
+                        }
+                    }
+
+                    if let Some(sender) = &self.tx_sender {
+                        let msg = WorkerMessage::Tx(TxRequest { head_index, data });
+                        if sender.send(msg).is_err() {
+                            log::error!("Failed to send to console worker");
+                        }
+                    } else {
+                        // Fallback: write synchronously
+                        let _ = io::stdout().write_all(&data);
+                        let _ = io::stdout().flush();
+                        let _ = queue.add_used(&mem, head_index, 0);
+                    }
+                }
+
+                // Signal interrupt if needed (for sync fallback path)
+                if self.tx_sender.is_none()
+                    && state
+                        .config
+                        .queues
+                        .get_mut(1)
+                        .is_some_and(|queue| queue.needs_notification(&mem).unwrap_or(true))
+                {
+                    default_signal_interrupt(&mut state.config, pic.as_ref(), irq_line);
+                }
+            }
+            _ => {}
         }
     }
 }
