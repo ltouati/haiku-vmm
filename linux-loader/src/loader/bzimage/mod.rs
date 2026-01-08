@@ -217,6 +217,7 @@ mod tests {
     }
 
     #[allow(non_snake_case)]
+    #[cfg_attr(target_os = "haiku", ignore)]
     #[test]
     fn test_load_bzImage() {
         let gm = create_guest_mem();

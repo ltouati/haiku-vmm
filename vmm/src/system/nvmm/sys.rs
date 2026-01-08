@@ -1,5 +1,7 @@
 //! Low-level FFI bindings to libnvmm
 #![allow(non_camel_case_types)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::pub_underscore_fields)]
 
 use libc::{c_int, c_void, size_t, uintptr_t};
 
@@ -346,6 +348,7 @@ unsafe extern "C" {
 }
 
 #[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+#[must_use]
 pub unsafe fn nvmm_init() -> c_int {
     -1
 }

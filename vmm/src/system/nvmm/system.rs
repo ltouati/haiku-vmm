@@ -20,7 +20,7 @@ impl NVMMSystem {
         unsafe {
             debug!("Calling nvmm_init...");
             let ret = nvmm_init();
-            debug!("nvmm_init returned: {}", ret);
+            debug!("nvmm_init returned: {ret}");
             if ret != 0 {
                 return Err(io::Error::last_os_error().into());
             }
@@ -37,8 +37,8 @@ impl VmmSystem for NVMMSystem {
 
         unsafe {
             debug!("Calling nvmm_machine_create...");
-            let ret = nvmm_machine_create(&mut *raw_box);
-            debug!("nvmm_machine_create returned: {}", ret);
+            let ret = nvmm_machine_create(&raw mut *raw_box);
+            debug!("nvmm_machine_create returned: {ret}");
             if ret != 0 {
                 return Err(io::Error::last_os_error().into());
             }

@@ -1,4 +1,6 @@
 //! Register constants and Segment Attribute bitflags
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::pub_underscore_fields)]
 use bitflags::bitflags;
 
 // State Masks
@@ -32,10 +34,10 @@ pub const GPR_RIP: usize = 16;
 pub const GPR_RFLAGS: usize = 17;
 
 /// Map iced-x86 Register to NVMM GPR index.
+#[must_use]
 pub fn reg_to_gpr(reg: iced_x86::Register) -> usize {
     use iced_x86::Register;
     match reg {
-        Register::RAX | Register::EAX | Register::AX | Register::AL => GPR_RAX,
         Register::RCX | Register::ECX | Register::CX | Register::CL => GPR_RCX,
         Register::RDX | Register::EDX | Register::DX | Register::DL => GPR_RDX,
         Register::RBX | Register::EBX | Register::BX | Register::BL => GPR_RBX,

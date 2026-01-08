@@ -128,7 +128,7 @@ pub fn write_mp_table(mem: &GuestMemoryMmap, base_addr: u64, cpus: u8) -> anyhow
         oem_table_ptr: 0,
         oem_table_size: 0,
         entry_count: 0,
-        lapic_addr: 0xFEE00000,
+        lapic_addr: 0xFEE0_0000,
         extended_table_len: 0,
         extended_table_checksum: 0,
         reserved: 0,
@@ -144,7 +144,7 @@ pub fn write_mp_table(mem: &GuestMemoryMmap, base_addr: u64, cpus: u8) -> anyhow
             lapic_ver: 0x14,
             cpu_flags: if i == 0 { 3 } else { 1 }, // Enabled | BSP (if 0)
             cpu_signature: 0x306C3,                // Haswell
-            feature_flags: 0xbfebfbff,             // From CPUID 1
+            feature_flags: 0xbfeb_fbff,            // From CPUID 1
             reserved: [0; 8],
         };
         entries_data.extend_from_slice(entry.as_bytes());

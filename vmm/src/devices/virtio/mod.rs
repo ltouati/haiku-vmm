@@ -60,6 +60,7 @@ impl DeviceType {
     ///
     /// Note that this does not mean a driver must activate these queues, only that they must be
     /// implemented by a spec-compliant device.
+    #[must_use]
     pub fn min_queues(&self) -> usize {
         match self {
             DeviceType::Net => 3,           // rx, tx (TODO: b/314353246: ctrl is optional)
@@ -111,7 +112,7 @@ impl std::fmt::Display for DeviceType {
 }
 
 /// Copy virtio device configuration data from a subslice of `src` to a subslice of `dst`.
-/// Unlike std::slice::copy_from_slice(), this function copies as much as possible within
+/// Unlike `std::slice::copy_from_slice()`, this function copies as much as possible within
 /// the common subset of the two slices, truncating the requested range instead of
 /// panicking if the slices do not match in size.
 ///
@@ -133,6 +134,7 @@ pub fn copy_config(dst: &mut [u8], dst_offset: u64, src: &[u8], src_offset: u64)
 }
 
 /// Returns the set of reserved base features common to all virtio devices.
+#[must_use]
 pub fn base_features() -> u64 {
     1 << VIRTIO_F_VERSION_1 | 1 << VIRTIO_RING_F_EVENT_IDX | 1 << VIRTIO_F_ACCESS_PLATFORM
 }
@@ -151,6 +153,7 @@ pub enum VirtioDeviceType {
 impl VirtioDeviceType {
     /// Returns the seccomp policy file that we will want to load for device `base`, depending on
     /// the virtio transport type.
+    #[must_use]
     pub fn seccomp_policy_file(&self, base: &str) -> String {
         match self {
             VirtioDeviceType::Regular => format!("{base}_device"),

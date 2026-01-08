@@ -17,7 +17,7 @@ use rand::{RngCore, SeedableRng};
 // Chosen to match the Linux guest driver RNG buffer refill size.
 const CHUNK_SIZE: usize = 64;
 
-/// VirtIO RNG Device
+/// `VirtIO` RNG Device
 pub struct RngDevice<B: HypervisorBackend> {
     config: VirtioConfig<Queue>,
     rng_source: StdRng,
@@ -30,8 +30,7 @@ pub struct RngDevice<B: HypervisorBackend> {
 impl<B: HypervisorBackend> RngDevice<B> {
     pub fn new() -> anyhow::Result<Self> {
         let mut queues = Vec::new();
-        queues
-            .push(Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create queue: {:?}", e))?);
+        queues.push(Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create queue: {e:?}"))?);
 
         let config_space = Vec::new();
         let mut device_features = 0u64;
@@ -92,7 +91,7 @@ impl<B: HypervisorBackend> RngDevice<B> {
 
                     let addr = desc.addr().checked_add(desc_offset as u64).unwrap();
                     if let Err(e) = mem.write_slice(&buf[..n], addr) {
-                        log::error!("Failed to write RNG slice: {:?}", e);
+                        log::error!("Failed to write RNG slice: {e:?}");
                         break;
                     }
                     total_written += n;
@@ -102,7 +101,7 @@ impl<B: HypervisorBackend> RngDevice<B> {
 
             if total_written > 0 {
                 if let Err(e) = queue.add_used(mem, chain.head_index(), total_written as u32) {
-                    log::error!("Failed to add used RNG: {:?}", e);
+                    log::error!("Failed to add used RNG: {e:?}");
                 }
 
                 if queue.needs_notification(mem).unwrap_or(true) {
@@ -114,7 +113,7 @@ impl<B: HypervisorBackend> RngDevice<B> {
         Ok(needs_interrupt)
     }
     fn signal_interrupt(&mut self) {
-        default_signal_interrupt(&mut self.config, self.pic.as_ref(), self.irq_line)
+        default_signal_interrupt(&mut self.config, self.pic.as_ref(), self.irq_line);
     }
 }
 
@@ -154,7 +153,7 @@ impl<B: HypervisorBackend> VirtioMmioDevice for RngDevice<B> {
     fn queue_notify(&mut self, _val: u32) {
         println!("VirtIO RNG Notify");
         let ret = self.process_queue();
-        println!("VirtIO RNG Notify Result: {:?}", ret);
+        println!("VirtIO RNG Notify Result: {ret:?}");
         match ret {
             Ok(needs_irq) => {
                 if needs_irq {
@@ -162,7 +161,7 @@ impl<B: HypervisorBackend> VirtioMmioDevice for RngDevice<B> {
                     self.signal_interrupt();
                 }
             }
-            Err(e) => log::error!("RNG queue processing error: {:?}", e),
+            Err(e) => log::error!("RNG queue processing error: {e:?}"),
         }
     }
 }

@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_truncation)]
 use crate::system::backend::HypervisorBackend;
 use crate::system::nvmm::sys::NvmmCpuid;
 use crate::system::vmachine::vcpu::Vcpu;
@@ -54,7 +55,7 @@ impl<B: HypervisorBackend> Machine<B> {
             // Get pointer to host memory
             let host_ptr = region
                 .get_host_address(MemoryRegionAddress(0))
-                .map_err(|e| anyhow!("{:?}", e))?;
+                .map_err(|e| anyhow!("{e:?}"))?;
 
             // Register HVA
             debug!("Calling nvmm_hva_map...");

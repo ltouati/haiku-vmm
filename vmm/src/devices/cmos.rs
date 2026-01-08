@@ -55,6 +55,7 @@ impl Cmos {
     /// Creates a new CMOS device.
     /// `mem_below_4g` is the size of memory in bytes below the 32-bit gap.
     /// `mem_above_4g` is the size of memory in bytes above the 32-bit gap.
+    #[must_use]
     pub fn new(mem_below_4g: u64, mem_above_4g: u64) -> Self {
         let mut data = [0u8; DATA_LEN];
 
@@ -88,7 +89,7 @@ impl Cmos {
         data[0x35] = (ext_mem_64k >> 8) as u8;
 
         // High memory (>4GB) in units of 64 KB (0x5b-0x5d)
-        let high_mem_64k = std::cmp::min(0xFFFFFF, mem_above_4g / (64 * 1024));
+        let high_mem_64k = std::cmp::min(0x00FF_FFFF, mem_above_4g / (64 * 1024));
         data[0x5b] = high_mem_64k as u8;
         data[0x5c] = (high_mem_64k >> 8) as u8;
         data[0x5d] = (high_mem_64k >> 16) as u8;
@@ -177,7 +178,7 @@ impl MutDevicePio for Cmos {
                 }
             }
             _ => {
-                debug!("CMOS: bad read offset {}", offset);
+                debug!("CMOS: bad read offset {offset}");
                 0
             }
         };
@@ -213,7 +214,7 @@ impl MutDevicePio for Cmos {
                 }
             }
             _ => {
-                debug!("CMOS: bad write offset {}", offset);
+                debug!("CMOS: bad write offset {offset}");
             }
         }
     }

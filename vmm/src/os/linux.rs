@@ -1,3 +1,7 @@
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
 use crate::devices::virtio::virtio_blk::BlockDevice;
 use crate::devices::virtio::virtio_console::ConsoleDevice;
 use crate::devices::virtio::virtio_mmio_device::MmioVirtioDevice;
@@ -130,6 +134,7 @@ fn translate_gva<M: GuestMemory>(mem: &M, cr3: u64, gva: u64) -> Option<u64> {
 }
 
 impl Linux64Guest {
+    #[must_use]
     pub fn new(
         kernel_path: PathBuf,
         cmdline: String,
@@ -207,7 +212,7 @@ impl Linux64Guest {
     ) -> anyhow::Result<GuestMemoryMmap> {
         let mem_size = self.memory_size_mib * 1024 * 1024;
         let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size as usize)])
-            .map_err(|e| io::Error::other(format!("{:?}", e)))?;
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
         machine.map_guest_memory(&guest_mem)?;
         Ok(guest_mem)
     }
@@ -246,7 +251,7 @@ impl Linux64Guest {
 
     fn load_initrd(&self, guest_mem: &GuestMemoryMmap) -> anyhow::Result<Option<(u64, u64)>> {
         if let Some(path) = &self.initrd_path {
-            info!("Loading initrd from {:?}", path);
+            info!("Loading initrd from {path:?}");
             let mut f = File::open(path)?;
             let size = f.metadata()?.len();
 
@@ -273,11 +278,11 @@ impl Linux64Guest {
 
         // 1. Dynamic VirtIO MMIO Arguments
         for dev in &self.mmio_devices {
-            let byte = Byte::from_bytes(dev.size as u128);
+            let byte = Byte::from_bytes(u128::from(dev.size));
             let adj_byte = byte.get_appropriate_unit(true); // true for Binary (1024 base)
             let s = adj_byte.format(0); // 0 decimal places
             // "4 KiB" -> "4K", "1 MiB" -> "1M"
-            let size_str = s.replace("iB", "").replace("B", "").replace(" ", "");
+            let size_str = s.replace("iB", "").replace(['B', ' '], "");
 
             let arg = format!(
                 " virtio_mmio.device={}@0x{:x}:{}",
@@ -313,14 +318,14 @@ impl Linux64Guest {
 
         // Write MP Table at 0x9FC00 (Top of base memory)
         crate::os::mptable::write_mp_table(guest_mem, 0x9FC00, 1)
-            .map_err(|e| io::Error::other(format!("Failed to write MP Table: {:?}", e)))?;
+            .map_err(|e| io::Error::other(format!("Failed to write MP Table: {e:?}")))?;
 
         LinuxBootConfigurator::write_bootparams(
             &BootParams::new(&params, GuestAddress(ZERO_PAGE_START)),
             guest_mem,
         )
-        .map_err(|e| io::Error::other(format!("Failed to write boot params: {:?}", e)))?;
-        info!("Final cmdline: {}", cmdline);
+        .map_err(|e| io::Error::other(format!("Failed to write boot params: {e:?}")))?;
+        info!("Final cmdline: {cmdline}");
         let mut cmdline_bytes = cmdline.as_bytes().to_vec();
         cmdline_bytes.push(0); // Null terminator
         guest_mem.write_slice(&cmdline_bytes, GuestAddress(BOOT_CMD_START))?;
@@ -388,7 +393,7 @@ impl Linux64Guest {
         gdt_table[4] = TSS_START >> 32;
 
         guest_mem.write_slice(
-            unsafe { std::slice::from_raw_parts(gdt_table.as_ptr() as *const u8, 40) },
+            unsafe { std::slice::from_raw_parts(gdt_table.as_ptr().cast::<u8>(), 40) },
             GuestAddress(BOOT_GDT_OFFSET),
         )?;
 
@@ -427,9 +432,9 @@ impl Linux64Guest {
         Ok(vcpu)
     }
 
-    pub fn run<'a, B: HypervisorBackend + 'static>(
+    pub fn run<B: HypervisorBackend + 'static>(
         &self,
-        vcpu: &mut Vcpu<'a, B>,
+        vcpu: &mut Vcpu<'_, B>,
         guest_mem: &GuestMemoryMmap,
     ) -> anyhow::Result<()> {
         info!("Starting VCPU...");
@@ -557,63 +562,63 @@ impl Linux64Guest {
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x40), 4)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     pit.clone(),
                 )
                 .context("PIT")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x61), 1)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     pit.clone(),
                 )
                 .context("Speaker")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x3F8), 8)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     serial.clone(),
                 )
                 .context("Serial")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x70), 2)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     cmos.clone(),
                 )
                 .context("CMOS")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x80), 0x10)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     debug_port,
                 )
                 .context("DebugPort")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x60), 1)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     i8042.clone(),
                 )
                 .context("I8042 Data")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x64), 1)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     i8042.clone(),
                 )
                 .context("I8042 Cmd")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x20), 2)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     pic.clone(),
                 )
                 .context("Master PIC")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0xA0), 2)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     pic.clone(),
                 )
                 .context("Slave PIC")?;
@@ -622,14 +627,14 @@ impl Linux64Guest {
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x4D0), 1)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     pic.clone(),
                 )
                 .context("ELCR1")?;
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0x4D1), 1)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     pic.clone(),
                 )
                 .context("ELCR2")?;
@@ -638,7 +643,7 @@ impl Linux64Guest {
             device_mgr
                 .register_pio(
                     PioRange::new(PioAddress(0xCF8), 8)
-                        .map_err(|e| anyhow!("Invalid PIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid PIO Range: {e:?}"))?,
                     pci_stub,
                 )
                 .context("PCI Stub")?;
@@ -648,14 +653,14 @@ impl Linux64Guest {
             device_mgr
                 .register_mmio(
                     MmioRange::new(MmioAddress(0xFEE00000), 0x1000)
-                        .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid MMIO Range: {e:?}"))?,
                     lapic.clone(),
                 )
                 .context("Failed to register LAPIC")?;
 
             // Initialize VirtIO Block
             if let Some(disk_path) = &self.disk_path {
-                info!("Initializing VirtIO Block with {:?}", disk_path);
+                info!("Initializing VirtIO Block with {}", disk_path.display());
                 let disk_file = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -672,7 +677,7 @@ impl Linux64Guest {
                 device_mgr
                     .register_mmio(
                         MmioRange::new(MmioAddress(VIRTIO_BLK_ADDR), VIRTIO_BLK_SIZE)
-                            .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
+                            .map_err(|e| anyhow!("Invalid MMIO Range: {e:?}"))?,
                         virtio_blk.clone(),
                     )
                     .context("Failed to register VirtIO Block")?;
@@ -690,7 +695,7 @@ impl Linux64Guest {
                 device_mgr
                     .register_mmio(
                         MmioRange::new(MmioAddress(VIRTIO_RNG_ADDR), 0x1000)
-                            .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
+                            .map_err(|e| anyhow!("Invalid MMIO Range: {e:?}"))?,
                         virtio_rng.clone(),
                     )
                     .context("Failed to register VirtIO RNG")?;
@@ -706,7 +711,7 @@ impl Linux64Guest {
             device_mgr
                 .register_mmio(
                     MmioRange::new(MmioAddress(VIRTIO_CONSOLE_ADDR), 0x1000)
-                        .map_err(|e| anyhow!("Invalid MMIO Range: {:?}", e))?,
+                        .map_err(|e| anyhow!("Invalid MMIO Range: {e:?}"))?,
                     virtio_console.clone(),
                 )
                 .context("Failed to register VirtIO Console")?;
@@ -744,7 +749,7 @@ impl Linux64Guest {
             let mut buffer = [0; 1];
             loop {
                 match io::stdin().read(&mut buffer) {
-                    Ok(0) => break,
+                    Ok(0) | Err(_) => break,
                     Ok(_) => {
                         serial_in
                             .lock()
@@ -760,7 +765,6 @@ impl Linux64Guest {
                         let _ = io::stdout().write(&buffer);
                         let _ = io::stdout().flush();
                     }
-                    Err(_) => break,
                 }
             }
         });
@@ -786,48 +790,48 @@ impl Linux64Guest {
                 // Check Reset First? No, usually after IO or during.
                 // But here the IO *causes* the reset.
 
-                if !is_in {
-                    // Write
-                    // Ignore errors (e.g. unmapped ports)
+                if is_in {
+                    // Read
+                    // Default to 0xFF (Unmapped)
+                    let mut read_data = vec![0xffu8; op_size as usize];
+                    // Attempt read, ignore errors
                     let _ = device_mgr
                         .lock()
                         .map_err(|_| anyhow!("Failed to lock device manager"))?
-                        .pio_write(vm_device::bus::PioAddress(port), &data);
-                    // CHECK RESET SIGNAL
-                    if reset_evt.load(Ordering::SeqCst) {
-                        info!("Reset Signal Detected!");
-                        return Ok(VmAction::Shutdown);
+                        .pio_read(vm_device::bus::PioAddress(port), &mut read_data);
+
+                    let mut val = 0u64;
+                    for (i, byte) in read_data.iter().enumerate() {
+                        val |= u64::from(*byte) << (i * 8);
                     }
 
-                        Ok(VmAction::SetRip(npc))
+                    let mask = if op_size >= 8 {
+                        0xffff_ffff_ffff_ffff
                     } else {
-                        // Read
-                        // Default to 0xFF (Unmapped)
-                        let mut read_data = vec![0xffu8; op_size as usize];
-                        // Attempt read, ignore errors
-                        let _ = device_mgr
-                            .lock()
-                            .map_err(|_| anyhow!("Failed to lock device manager"))?
-                            .pio_read(vm_device::bus::PioAddress(port), &mut read_data);
+                        (1u64 << (op_size * 8)) - 1
+                    };
 
-                        let mut val = 0u64;
-                        for (i, byte) in read_data.iter().enumerate() {
-                            val |= (*byte as u64) << (i * 8);
-                        }
+                    Ok(VmAction::WriteRegMasked {
+                        reg: regs::GPR_RAX,
+                        val,
+                        mask,
+                        next_rip: npc,
+                    })
+                } else {
+                // Write
+                // Ignore errors (e.g. unmapped ports)
+                let _ = device_mgr
+                    .lock()
+                    .map_err(|_| anyhow!("Failed to lock device manager"))?
+                    .pio_write(vm_device::bus::PioAddress(port), &data);
+                // CHECK RESET SIGNAL
+                if reset_evt.load(Ordering::SeqCst) {
+                    info!("Reset Signal Detected!");
+                    return Ok(VmAction::Shutdown);
+                }
 
-                        let mask = if op_size >= 8 {
-                            0xffff_ffff_ffff_ffff
-                        } else {
-                            (1u64 << (op_size * 8)) - 1
-                        };
-
-                        Ok(VmAction::WriteRegMasked {
-                            reg: regs::GPR_RAX,
-                            val,
-                            mask,
-                            next_rip: npc,
-                        })
-                    }
+                    Ok(VmAction::SetRip(npc))
+                }
             })
             // Robust Memory Handler (LAPIC Fix)
             .on_memory(move |gpa, is_write, inst_len, inst_bytes, value| {
@@ -842,11 +846,11 @@ impl Linux64Guest {
                         if let Some(i) = instruction {
                              log::debug!("MMIO Instr: {:?} {} (len={})", i.code(), i, i.len());
                         }
-                        let size = instruction.map(|i| i.memory_size().size()).unwrap_or(4);
+                        let size = instruction.map_or(4, |i| i.memory_size().size());
                         let reg = instruction.and_then(|i| {
-                            if !is_write { Some(regs::reg_to_gpr(i.op0_register())) } else { None }
+                            if is_write { None } else { Some(regs::reg_to_gpr(i.op0_register())) }
                         }).unwrap_or(regs::GPR_RAX);
-                        (inst_len as u64, reg, size, None)
+                        (u64::from(inst_len), reg, size, None)
                     } else {
                         // Manual fetch fallback
                         if let Ok(state) = injector.get_state(sys::NVMM_X64_STATE_ALL) {
@@ -870,30 +874,30 @@ impl Linux64Guest {
                                 if let Some(instruction) = decoder.iter().next() {
                                     let size = instruction.memory_size().size();
                                     let len = instruction.len() as u64;
-                                    let (reg, val) = if !is_write {
-                                        (regs::reg_to_gpr(instruction.op0_register()), None)
-                                    } else {
+                                    let (reg, val) = if is_write {
                                         // For Write: Op0 is destination (Memory), Op1 is Source (Register or Immediate)
                                         // But wait, for MOV [mem], reg -> Op0=Mem, Op1=Reg.
                                         // We need the Register from Op1.
                                         let op1 = instruction.op1_register();
-                                        if op1 != iced_x86::Register::None {
-                                            let r = regs::reg_to_gpr(op1);
-                                            (r, Some(state.gprs[r]))
-                                        } else {
+                                        if op1 == iced_x86::Register::None {
                                             // Handle Immediate?
                                             if instruction.op1_kind() == iced_x86::OpKind::Immediate8 {
-                                                 (regs::GPR_RAX, Some(instruction.immediate8() as u64))
+                                                 (regs::GPR_RAX, Some(u64::from(instruction.immediate8())))
                                             } else if instruction.op1_kind() == iced_x86::OpKind::Immediate32 {
-                                                 (regs::GPR_RAX, Some(instruction.immediate32() as u64))
+                                                 (regs::GPR_RAX, Some(u64::from(instruction.immediate32())))
                                             } else {
                                                  (regs::GPR_RAX, None) // Unknown
                                             }
+                                        } else {
+                                            let r = regs::reg_to_gpr(op1);
+                                            (r, Some(state.gprs[r]))
                                         }
+                                    } else {
+                                        (regs::reg_to_gpr(instruction.op0_register()), None)
                                     };
 
                                     if len > 0 {
-                                        debug!("Manually decoded MMIO instr at {:#x}: len={}, reg={}, size={}, val={:?}", rip, len, reg, size, val);
+                                        debug!("Manually decoded MMIO instr at {rip:#x}: len={len}, reg={reg}, size={size}, val={val:?}");
                                         (len, reg, size, val)
                                     } else { (0, regs::GPR_RAX, 4, None) }
                                 } else { (0, regs::GPR_RAX, 4, None) }
@@ -910,20 +914,18 @@ impl Linux64Guest {
                         let val_bytes = val_to_write.to_le_bytes();
                         device_mgr.lock().expect("Poisoned lock")
                             .mmio_write(MmioAddress(gpa), &val_bytes[..size])
-                            .map_err(|e| anyhow!("MMIO Write Error at {:#x}: {:?}", gpa, e))?;
+                            .map_err(|e| anyhow!("MMIO Write Error at {gpa:#x}: {e:?}"))?;
                         Ok(VmAction::AdvanceRip(final_len))
                     } else {
                         let mut data = [0u8; 8];
                         device_mgr.lock().expect("Poisoned lock")
                             .mmio_read(MmioAddress(gpa), &mut data[..size])
-                            .map_err(|e| anyhow!("MMIO Read Error at {:#x}: {:?}", gpa, e))?;
+                            .map_err(|e| anyhow!("MMIO Read Error at {gpa:#x}: {e:?}"))?;
 
                         let val = u64::from_le_bytes(data);
                         let mask = match size {
                             1 => 0xFF,
                             2 => 0xFFFF,
-                            4 => 0xFFFF_FFFF_FFFF_FFFF, // Zero extend
-                            8 => 0xFFFF_FFFF_FFFF_FFFF,
                             _ => 0xFFFF_FFFF_FFFF_FFFF,
                         };
                         Ok(VmAction::WriteRegAndContinue {
@@ -945,16 +947,16 @@ impl Linux64Guest {
 
                     // KVM Clock MSRs
                     if msr == 0x11 || msr == 0x12 || msr == 0x4b564d00 || msr == 0x4b564d01 {
-                        debug!("KVM Clock MSR Access: msr={:#x}, is_write={}, val={:#x}", msr, is_write, val);
+                        debug!("KVM Clock MSR Access: msr={msr:#x}, is_write={is_write}, val={val:#x}");
                         // For now, return 0 on read and ignore write.
                         // Real implementation would track GPA and update wallclock/system time.
                         if !is_write {
                             let mut state = injector.get_state(sys::NVMM_X64_STATE_GPRS)
-                                .map_err(|e| anyhow!("Failed to get state: {}", e))?;
+                                .map_err(|e| anyhow!("Failed to get state: {e}"))?;
                             state.gprs[regs::GPR_RAX] = 0;
                             state.gprs[regs::GPR_RDX] = 0;
                             injector.set_state(&state, sys::NVMM_X64_STATE_GPRS)
-                                .map_err(|e| anyhow!("Failed to set state: {}", e))?;
+                                .map_err(|e| anyhow!("Failed to set state: {e}"))?;
                         }
                         return Ok(VmAction::SetRip(npc));
                     }
@@ -963,11 +965,11 @@ impl Linux64Guest {
                     if msr == 0x10a {
                          if !is_write {
                             let mut state = injector.get_state(sys::NVMM_X64_STATE_GPRS)
-                                .map_err(|e| anyhow!("Failed to get state: {}", e))?;
+                                .map_err(|e| anyhow!("Failed to get state: {e}"))?;
                             state.gprs[regs::GPR_RAX] = 0; // No special capabilities
                             state.gprs[regs::GPR_RDX] = 0;
                             injector.set_state(&state, sys::NVMM_X64_STATE_GPRS)
-                                .map_err(|e| anyhow!("Failed to set state: {}", e))?;
+                                .map_err(|e| anyhow!("Failed to set state: {e}"))?;
                          }
                          return Ok(VmAction::SetRip(npc));
                     }
@@ -975,12 +977,12 @@ impl Linux64Guest {
                     // FS_BASE (0xC0000100)
                     if msr == 0xC0000100 {
                         let mut state = injector.get_state(sys::NVMM_X64_STATE_SEGS)
-                            .map_err(|e| anyhow!("Failed to get SEGS: {}", e))?;
+                            .map_err(|e| anyhow!("Failed to get SEGS: {e}"))?;
                         if is_write {
-                            info!("Setting FS_BASE to {:#x}", val);
+                            info!("Setting FS_BASE to {val:#x}");
                             state.segs[sys::NVMM_X64_SEG_FS].base = val;
                             injector.set_state(&state, sys::NVMM_X64_STATE_SEGS)
-                                .map_err(|e| anyhow!("Failed to set FS_BASE: {}", e))?;
+                                .map_err(|e| anyhow!("Failed to set FS_BASE: {e}"))?;
                         } else {
                             // TODO: Read
                         }
@@ -989,11 +991,11 @@ impl Linux64Guest {
                     // GS_BASE (0xC0000101)
                     if msr == 0xC0000101 {
                         let mut state = injector.get_state(sys::NVMM_X64_STATE_SEGS)
-                            .map_err(|e| anyhow!("Failed to get SEGS: {}", e))?;
+                            .map_err(|e| anyhow!("Failed to get SEGS: {e}"))?;
                         if is_write {
                             state.segs[sys::NVMM_X64_SEG_GS].base = val;
                             injector.set_state(&state, sys::NVMM_X64_STATE_SEGS)
-                                .map_err(|e| anyhow!("Failed to set GS_BASE: {}", e))?;
+                                .map_err(|e| anyhow!("Failed to set GS_BASE: {e}"))?;
                         }
                          return Ok(VmAction::SetRip(npc));
                     }
@@ -1001,11 +1003,11 @@ impl Linux64Guest {
                     // KERNEL_GS_BASE (0xC0000102) -> MSR Index 5
                     if msr == 0xC0000102 {
                         let mut state = injector.get_state(sys::NVMM_X64_STATE_MSRS)
-                            .map_err(|e| anyhow!("Failed to get MSRS: {}", e))?;
+                            .map_err(|e| anyhow!("Failed to get MSRS: {e}"))?;
                         if is_write {
                             state.msrs[5] = val;
                             injector.set_state(&state, sys::NVMM_X64_STATE_MSRS)
-                                .map_err(|e| anyhow!("Failed to set KERNEL_GS_BASE: {}", e))?;
+                                .map_err(|e| anyhow!("Failed to set KERNEL_GS_BASE: {e}"))?;
                         }
                          return Ok(VmAction::SetRip(npc));
                     }
@@ -1013,11 +1015,11 @@ impl Linux64Guest {
                      // STAR (0xC0000081) -> MSR Index 1
                     if msr == 0xC0000081 {
                          let mut state = injector.get_state(sys::NVMM_X64_STATE_MSRS)
-                            .map_err(|e| anyhow!("Failed to get MSRS: {}", e))?;
+                            .map_err(|e| anyhow!("Failed to get MSRS: {e}"))?;
                         if is_write {
                             state.msrs[1] = val;
                             injector.set_state(&state, sys::NVMM_X64_STATE_MSRS)
-                                .map_err(|e| anyhow!("Failed to set STAR: {}", e))?;
+                                .map_err(|e| anyhow!("Failed to set STAR: {e}"))?;
                         }
                          return Ok(VmAction::SetRip(npc));
                     }
@@ -1025,38 +1027,38 @@ impl Linux64Guest {
                     // LSTAR (0xC0000082) -> MSR Index 2
                     if msr == 0xC0000082 {
                          let mut state = injector.get_state(sys::NVMM_X64_STATE_MSRS)
-                            .map_err(|e| anyhow!("Failed to get MSRS: {}", e))?;
+                            .map_err(|e| anyhow!("Failed to get MSRS: {e}"))?;
                         if is_write {
-                            debug!("Setting LSTAR to {:#x}", val);
+                            debug!("Setting LSTAR to {val:#x}");
                             state.msrs[2] = val;
                             injector.set_state(&state, sys::NVMM_X64_STATE_MSRS)
-                                .map_err(|e| anyhow!("Failed to set LSTAR: {}", e))?;
+                                .map_err(|e| anyhow!("Failed to set LSTAR: {e}"))?;
                         }
                          return Ok(VmAction::SetRip(npc));
                     }
 
                      // SFMASK (0xC0000084) -> MSR Index 4
-                    if msr == 0xC0000084 {
+                    if msr == 0xC000_0084 {
                          let mut state = injector.get_state(sys::NVMM_X64_STATE_MSRS)
-                            .map_err(|e| anyhow!("Failed to get MSRS: {}", e))?;
+                            .map_err(|e| anyhow!("Failed to get MSRS: {e}"))?;
                         if is_write {
                             state.msrs[4] = val;
                             injector.set_state(&state, sys::NVMM_X64_STATE_MSRS)
-                                .map_err(|e| anyhow!("Failed to set SFMASK: {}", e))?;
+                                .map_err(|e| anyhow!("Failed to set SFMASK: {e}"))?;
                         }
                          return Ok(VmAction::SetRip(npc));
                     }
-                    debug!("Handling MSR Exit: msr={:#x}, is_write={}, val={:#x}", msr, is_write, val);
-                    if !is_write {
+                    debug!("Handling MSR Exit: msr={msr:#x}, is_write={is_write}, val={val:#x}");
+                    if is_write {
+                        Ok(VmAction::SetRip(npc))
+                    } else {
                         // Return 0
                         let mut state = injector.get_state(sys::NVMM_X64_STATE_GPRS)
-                            .map_err(|e| anyhow!("Failed to get state: {}", e))?;
+                            .map_err(|e| anyhow!("Failed to get state: {e}"))?;
                         state.gprs[regs::GPR_RAX] = 0;
                         state.gprs[regs::GPR_RDX] = 0;
                         injector.set_state(&state, sys::NVMM_X64_STATE_GPRS)
-                            .map_err(|e| anyhow!("Failed to set state: {}", e))?;
-                        Ok(VmAction::SetRip(npc))
-                    } else {
+                            .map_err(|e| anyhow!("Failed to set state: {e}"))?;
                         Ok(VmAction::SetRip(npc))
                     }
             })
@@ -1091,7 +1093,7 @@ impl Linux64Guest {
                     Ok(())
             })
             .on_unknown(|reason| {
-                error!("Unknown VM Exit Reason: {:#x}", reason);
+                error!("Unknown VM Exit Reason: {reason:#x}");
                 Ok(VmAction::Shutdown)
             })
             .run()
@@ -1099,8 +1101,8 @@ impl Linux64Guest {
 }
 
 fn make_gdt_entry(base: u64, limit: u64, access: u8, flags: u8) -> u64 {
-    let flags = flags as u64;
-    let access = access as u64;
+    let flags = u64::from(flags);
+    let access = u64::from(access);
 
     ((base & 0xff00_0000u64) << 32)
         | ((base & 0x00ff_ffffu64) << 16)
@@ -1133,12 +1135,12 @@ fn use_long_mode_pagetables(mem: &GuestMemoryMmap) -> anyhow::Result<()> {
     // Low Mapping (0-512GB) -> PDPTE (0xb000)
     // PML4[0] -> PDPTE | 0x3 (P|RW)
     mem.write_obj(pdpte_addr.raw_value() | 0x3, pml4_addr)
-        .map_err(|e| anyhow!("Failed to write PML4: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to write PML4: {e:?}"))?;
 
     // Low Mapping (0-1GB) -> PDE (0xc000)
     // PDPTE[0] -> PDE | 0x3
     mem.write_obj(pde_addr.raw_value() | 0x3, pdpte_addr)
-        .map_err(|e| anyhow!("Failed to write PDPTE: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to write PDPTE: {e:?}"))?;
 
     // High Memory / Kernel Space Mapping (-2GB)
     // Virtual 0xffffffff80000000 -> Physical 0
@@ -1149,7 +1151,7 @@ fn use_long_mode_pagetables(mem: &GuestMemoryMmap) -> anyhow::Result<()> {
             .checked_add(511 * 8)
             .ok_or(anyhow!("PML4 Address Overflow"))?,
     )
-    .map_err(|e| anyhow!("Failed to write PML4 high: {:?}", e))?;
+    .map_err(|e| anyhow!("Failed to write PML4 high: {e:?}"))?;
 
     // PDPTE[510] -> PDE | 0x3 (Reuse 0xc000)
     mem.write_obj(
@@ -1158,7 +1160,7 @@ fn use_long_mode_pagetables(mem: &GuestMemoryMmap) -> anyhow::Result<()> {
             .checked_add(510 * 8)
             .ok_or(anyhow!("PDPTE Address Overflow"))?,
     )
-    .map_err(|e| anyhow!("Failed to write PDPTE high: {:?}", e))?;
+    .map_err(|e| anyhow!("Failed to write PDPTE high: {e:?}"))?;
 
     // PDE[0..512] -> 2MB Pages | 0x83 (P|RW|PS) -> 0b10000011
     for i in 0..512 {
@@ -1169,7 +1171,7 @@ fn use_long_mode_pagetables(mem: &GuestMemoryMmap) -> anyhow::Result<()> {
                 .checked_add(i * 8)
                 .ok_or(anyhow!("PDE Address Overflow"))?,
         )
-        .map_err(|e| anyhow!("Failed to write PDE: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to write PDE: {e:?}"))?;
     }
 
     Ok(())

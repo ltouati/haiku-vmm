@@ -88,8 +88,8 @@ impl<'a, B: HypervisorBackend> Vcpu<'a, B> {
     pub fn injector(&self) -> VcpuInjector<B> {
         // Unsafe: Getting pointers to handles.
         // B::MachineHandle is owned by Machine. Machine is assumed pinned/stable during run.
-        let mach_ptr = &self.machine.raw as *const B::MachineHandle as *mut B::MachineHandle;
-        let vcpu_ptr = &self.raw as *const B::VcpuHandle as *mut B::VcpuHandle;
+        let mach_ptr = (&raw const self.machine.raw).cast_mut();
+        let vcpu_ptr = (&raw const self.raw).cast_mut();
 
         VcpuInjector {
             machine: mach_ptr,
@@ -100,11 +100,14 @@ impl<'a, B: HypervisorBackend> Vcpu<'a, B> {
     }
 
     /// Internal function to run the CPU once.
+    #[allow(clippy::missing_panics_doc)]
     pub fn run(&mut self) -> Result<VmExit> {
         unsafe {
             // Update TID storage
-            self.tid
-                .store(libc::pthread_self() as usize, Ordering::Relaxed);
+            self.tid.store(
+                usize::try_from(libc::pthread_self()).unwrap(),
+                Ordering::Relaxed,
+            );
 
             let exit_result = self
                 .machine
@@ -113,10 +116,10 @@ impl<'a, B: HypervisorBackend> Vcpu<'a, B> {
 
             match exit_result {
                 Ok(exit) => {
-                    debug!("VM Exit Reason: {:?}", exit);
+                    debug!("VM Exit Reason: {exit:?}");
                     Ok(exit)
                 }
-                Err(exit_result) => Err(anyhow!("VM Exit Reason: {:?}", exit_result)),
+                Err(exit_result) => Err(anyhow!("VM Exit Reason: {exit_result:?}")),
             }
         }
     }
@@ -228,9 +231,9 @@ impl<B: HypervisorBackend> VcpuInjector<B> {
         let rbp = state.gprs[regs::GPR_RBP];
         let cr3 = state.crs[2];
 
-        println!("RIP: {:016x}", rip);
-        println!("RBP: {:016x}", rbp);
-        println!("CR3: {:016x}", cr3);
+        println!("RIP: {rip:016x}");
+        println!("RBP: {rbp:016x}");
+        println!("CR3: {cr3:016x}");
 
         // Walk Stack
         let mut stack_ips = Vec::new();
@@ -242,9 +245,8 @@ impl<B: HypervisorBackend> VcpuInjector<B> {
                 break;
             }
 
-            let current_rbp_gpa = match translate_gva(mem, cr3, current_rbp_gva) {
-                Some(addr) => addr,
-                None => break,
+            let Some(current_rbp_gpa) = translate_gva(mem, cr3, current_rbp_gva) else {
+                break;
             };
 
             let next_rbp: u64 = match mem.read_obj(GuestAddress(current_rbp_gpa)) {
@@ -252,9 +254,8 @@ impl<B: HypervisorBackend> VcpuInjector<B> {
                 Err(_) => break,
             };
 
-            let ret_addr_gpa = match translate_gva(mem, cr3, current_rbp_gva + 8) {
-                Some(addr) => addr,
-                None => break,
+            let Some(ret_addr_gpa) = translate_gva(mem, cr3, current_rbp_gva + 8) else {
+                break;
             };
 
             let ret_addr: u64 = match mem.read_obj(GuestAddress(ret_addr_gpa)) {
@@ -278,7 +279,7 @@ impl<B: HypervisorBackend> VcpuInjector<B> {
                 cmd.arg("-e").arg(path).arg("-f");
 
                 for ip in &stack_ips {
-                    cmd.arg(format!("{:x}", ip));
+                    cmd.arg(format!("{ip:x}"));
                 }
 
                 match cmd.output() {
@@ -288,17 +289,17 @@ impl<B: HypervisorBackend> VcpuInjector<B> {
                         for (i, ip) in stack_ips.iter().enumerate() {
                             let func = lines.get(i * 2).unwrap_or(&"??");
                             let file = lines.get(i * 2 + 1).unwrap_or(&"??");
-                            println!("#{:<2} {:#018x} in {} at {}", i, ip, func, file);
+                            println!("#{i:<2} {ip:#018x} in {func} at {file}");
                         }
                     }
                     Err(e) => {
-                        println!("Failed to run addr2line: {}", e);
+                        println!("Failed to run addr2line: {e}");
                     }
                 }
             } else {
                 println!("\nStack Trace (IPs only):");
                 for (i, ip) in stack_ips.iter().enumerate() {
-                    println!("#{:<2} {:#018x}", i, ip);
+                    println!("#{i:<2} {ip:#018x}");
                 }
             }
         }

@@ -56,7 +56,7 @@ impl Channel {
         let elapsed_ns = self.count_load_time.elapsed().as_nanos() as u64;
         let d = (elapsed_ns * FREQUENCY) / NANOSECONDS_PER_SECOND;
 
-        let count = self.count as u64;
+        let count = u64::from(self.count);
         let counter_val = match self.mode {
             0 | 1 | 4 | 5 => {
                 // Mode 0: Interrupt on Terminal Count
@@ -86,10 +86,11 @@ impl Channel {
         counter_val as u16
     }
 
+    #[must_use]
     pub fn get_out(&self) -> bool {
         let elapsed_ns = self.count_load_time.elapsed().as_nanos() as u64;
         let d = (elapsed_ns * FREQUENCY) / NANOSECONDS_PER_SECOND;
-        let count = self.count as u64;
+        let count = u64::from(self.count);
 
         match self.mode {
             0 | 1 => d >= count,
@@ -115,19 +116,13 @@ impl Channel {
     pub fn update_irq(&mut self) -> u64 {
         let elapsed_ns = self.count_load_time.elapsed().as_nanos() as u64;
         let d = (elapsed_ns * FREQUENCY) / NANOSECONDS_PER_SECOND;
-        let count = self.count as u64;
+        let count = u64::from(self.count);
         if count == 0 {
             return 0;
         }
 
         let total_irqs = match self.mode {
-            0 | 1 => {
-                if d >= count {
-                    1
-                } else {
-                    0
-                }
-            }
+            0 | 1 => u64::from(d >= count),
             2 | 3 => {
                 if d > 0 {
                     d / count
@@ -148,7 +143,7 @@ impl Channel {
     }
 
     fn load_count(&mut self, val: u16) {
-        let val32 = if val == 0 { 0x10000 } else { val as u32 };
+        let val32 = if val == 0 { 0x10000 } else { u32::from(val) };
         self.count = val32;
         self.count_load_time = Instant::now();
         self.prev_tick_count = 0;
@@ -183,6 +178,7 @@ impl Default for Pit {
 }
 
 impl Pit {
+    #[must_use]
     pub fn new() -> Self {
         let mut p = Pit {
             channel0: Channel::new(),
@@ -196,6 +192,7 @@ impl Pit {
         p
     }
 
+    #[must_use]
     pub fn get_irq(&self) -> bool {
         self.channel0.get_out()
     }
@@ -330,7 +327,7 @@ impl Pit {
                             // 5-4: RW Mode
                             // 3-1: Mode
                             // 0: BCD
-                            let out = if s.get_out() { 1 } else { 0 };
+                            let out = u8::from(s.get_out());
                             s.status = (out << 7) | (s.rw_mode << 4) | (s.mode << 1) | s.bcd;
                             s.status_latched = true;
                         }
@@ -376,17 +373,17 @@ impl Pit {
 
             match s.write_state {
                 RwState::Lsb => {
-                    s.load_count(val as u16);
+                    s.load_count(u16::from(val));
                 }
                 RwState::Msb => {
-                    s.load_count((val as u16) << 8);
+                    s.load_count(u16::from(val) << 8);
                 }
                 RwState::Word0 => {
                     s.write_latch = val;
                     s.write_state = RwState::Word1;
                 }
                 RwState::Word1 => {
-                    s.load_count((s.write_latch as u16) | ((val as u16) << 8));
+                    s.load_count(u16::from(s.write_latch) | (u16::from(val) << 8));
                     s.write_state = RwState::Word0;
                 }
             }

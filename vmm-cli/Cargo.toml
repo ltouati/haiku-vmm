@@ -10,4 +10,3 @@ log = "0.4"
 anyhow = "1.0.100"
 clap = { version = "4.4.11", features = ["derive"] }
 signal-hook = "0.3"
-deloxide = "1.0.0"

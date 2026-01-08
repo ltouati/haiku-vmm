@@ -87,7 +87,7 @@ impl MutDevicePio for I8042Wrapper {
                 debug!("I8042 Read Data: {:#x}", data[0]);
             }
             _ => {
-                warn!("I8042: Invalid read at offset {}", offset);
+                warn!("I8042: Invalid read at offset {offset}");
                 data[0] = 0;
             }
         }
@@ -103,7 +103,7 @@ impl MutDevicePio for I8042Wrapper {
 
         match offset {
             OFS_STATUS => {
-                debug!("I8042 Write Command: {:#x}", val);
+                debug!("I8042 Write Command: {val:#x}");
                 match val {
                     CMD_RESET_CPU => {
                         error!("I8042: CPU Reset requested");
@@ -113,7 +113,7 @@ impl MutDevicePio for I8042Wrapper {
                         self.flush_buf();
                         let ctrl = self.control;
                         self.push_byte(ctrl);
-                        debug!("I8042: CMD_READ_CTR -> {:#x}", ctrl);
+                        debug!("I8042: CMD_READ_CTR -> {ctrl:#x}");
                     }
                     CMD_WRITE_CTR => {
                         self.flush_buf();
@@ -125,7 +125,7 @@ impl MutDevicePio for I8042Wrapper {
                         self.flush_buf();
                         let outp = self.outp;
                         self.push_byte(outp);
-                        debug!("I8042: CMD_READ_OUTP -> {:#x}", outp);
+                        debug!("I8042: CMD_READ_OUTP -> {outp:#x}");
                     }
                     CMD_WRITE_OUTP => {
                         self.status |= SB_I8042_CMD_DATA;
@@ -155,21 +155,21 @@ impl MutDevicePio for I8042Wrapper {
                         debug!("I8042: Interface Test -> 0x00");
                     }
                     _ => {
-                        debug!("I8042: Unknown/Ignored Command {:#x}", val);
+                        debug!("I8042: Unknown/Ignored Command {val:#x}");
                     }
                 }
             }
             OFS_DATA => {
-                debug!("I8042 Write Data: {:#x}", val);
+                debug!("I8042 Write Data: {val:#x}");
                 if (self.status & SB_I8042_CMD_DATA) != 0 {
                     match self.cmd {
                         CMD_WRITE_CTR => {
                             self.control = val;
-                            debug!("I8042: Control set to {:#x}", val);
+                            debug!("I8042: Control set to {val:#x}");
                         }
                         CMD_WRITE_OUTP => {
                             self.outp = val;
-                            debug!("I8042: Output set to {:#x}", val);
+                            debug!("I8042: Output set to {val:#x}");
                         }
                         _ => {}
                     }
@@ -178,10 +178,10 @@ impl MutDevicePio for I8042Wrapper {
                     // Send force ack for keyboard data
                     self.flush_buf();
                     self.push_byte(0xFA);
-                    debug!("I8042: Keyboard Data {:#x}, sending ACK", val);
+                    debug!("I8042: Keyboard Data {val:#x}, sending ACK");
                 }
             }
-            _ => warn!("I8042: Invalid write at offset {}", offset),
+            _ => warn!("I8042: Invalid write at offset {offset}"),
         }
     }
 }

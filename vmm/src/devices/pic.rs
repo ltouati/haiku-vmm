@@ -151,6 +151,7 @@ impl Default for Pic {
 }
 
 impl Pic {
+    #[must_use]
     pub fn new() -> Self {
         let mut primary = PicState::new();
         primary.irq_base = 0x20; // Default Master Vector Base
@@ -390,7 +391,7 @@ impl Pic {
 
     fn elcr_write(&mut self, select: PicSelect, val: u8) {
         let pic = &mut self.pics[select as usize];
-        debug!("PIC {:?} ELCR Write: {:#x}", select, val);
+        debug!("PIC {select:?} ELCR Write: {val:#x}");
         pic.elcr = val & pic.elcr_mask;
     }
 
@@ -406,7 +407,7 @@ impl Pic {
             pic.read_reg_select = false; // Reset read select
             pic.init_icw4 = (val & 0x01) != 0;
             // Trace
-            debug!("PIC {:?} Init ICW1: {:#x}", select, val);
+            debug!("PIC {select:?} Init ICW1: {val:#x}");
         } else if (val & 0x08) != 0 {
             // OCW3
             if (val & OCW3_POLL) != 0 {
@@ -453,7 +454,7 @@ impl Pic {
             PicInitState::Icw1 => {
                 // Not init state: OCW1 (IMR Write)
                 pic.imr = val;
-                debug!("PIC {:?} IMR update: {:#x}", select, val);
+                debug!("PIC {select:?} IMR update: {val:#x}");
             }
             PicInitState::Icw2 => {
                 pic.irq_base = val & 0xF8;
@@ -486,13 +487,13 @@ impl MutDevicePio for Pic {
         // 0x4D0 -> ELCR1, 0x4D1 -> ELCR2
         // We assume caller routes correctly.
         // But `base` + `offset` allows flexible routing.
-        let port = (base.0 as u64) + (offset as u64);
+        let port = u64::from(base.0) + u64::from(offset);
 
         self.pio_read(port as u16, data);
     }
 
     fn pio_write(&mut self, base: PioAddress, offset: u16, data: &[u8]) {
-        let port = (base.0 as u64) + (offset as u64);
+        let port = u64::from(base.0) + u64::from(offset);
 
         self.pio_write(port as u16, data);
     }

@@ -25,7 +25,7 @@ pub struct VirtioConsoleConfig {
     pub emerg_wr: u16,
 }
 
-/// VirtIO Console Device
+/// `VirtIO` Console Device
 pub struct ConsoleDevice<B: HypervisorBackend> {
     config: VirtioConfig<Queue>,
     guest_mem: Option<GuestMemoryMmap>,
@@ -42,10 +42,10 @@ impl<B: HypervisorBackend> ConsoleDevice<B> {
         // Console has 2 queues: RX (0), TX (1)
         let mut queues = Vec::new();
         queues.push(
-            Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create RX queue: {:?}", e))?,
+            Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create RX queue: {e:?}"))?,
         );
         queues.push(
-            Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create TX queue: {:?}", e))?,
+            Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create TX queue: {e:?}"))?,
         );
 
         // Config Space
@@ -59,7 +59,7 @@ impl<B: HypervisorBackend> ConsoleDevice<B> {
         // Serialize config
         let config_space = unsafe {
             std::slice::from_raw_parts(
-                &console_config as *const _ as *const u8,
+                (&raw const console_config).cast::<u8>(),
                 std::mem::size_of::<VirtioConsoleConfig>(),
             )
             .to_vec()
@@ -96,12 +96,12 @@ impl<B: HypervisorBackend> ConsoleDevice<B> {
         match self.process_rx() {
             Ok(true) => self.signal_interrupt(),
             Ok(false) => {}
-            Err(e) => log::error!("Failed to process RX on input: {:?}", e),
+            Err(e) => log::error!("Failed to process RX on input: {e:?}"),
         }
     }
 
     fn signal_interrupt(&mut self) {
-        default_signal_interrupt(&mut self.config, self.pic.as_ref(), self.irq_line)
+        default_signal_interrupt(&mut self.config, self.pic.as_ref(), self.irq_line);
     }
 
     // Process RX Queue (0): Host -> Guest
@@ -205,13 +205,13 @@ impl<B: HypervisorBackend> ConsoleDevice<B> {
 
                 let mut buf = vec![0u8; len];
                 match mem.read_slice(&mut buf, addr) {
-                    Ok(_) => {
+                    Ok(()) => {
                         // Write to stdout
                         let _ = io::stdout().write(&buf);
                         let _ = io::stdout().flush();
                         // total_read += len; unused
                     }
-                    Err(e) => log::error!("Failed to read TX guest mem: {:?}", e),
+                    Err(e) => log::error!("Failed to read TX guest mem: {e:?}"),
                 }
             }
 
@@ -263,20 +263,20 @@ impl<B: HypervisorBackend> BorrowMut<VirtioConfig<Queue>> for ConsoleDevice<B> {
 
 impl<B: HypervisorBackend> VirtioMmioDevice for ConsoleDevice<B> {
     fn queue_notify(&mut self, val: u32) {
-        println!("VirtIO Console Notify: {}", val);
+        println!("VirtIO Console Notify: {val}");
         let res = match val {
             0 => self.process_rx(),
             1 => self.process_tx(),
             _ => Ok(false),
         };
-        println!("VirtIO Console Notify Result: {:?}", res);
+        println!("VirtIO Console Notify Result: {res:?}");
         match res {
             Ok(needs_irq) => {
                 if needs_irq {
                     self.signal_interrupt();
                 }
             }
-            Err(e) => log::error!("Console queue error: {:?}", e),
+            Err(e) => log::error!("Console queue error: {e:?}"),
         }
     }
 }

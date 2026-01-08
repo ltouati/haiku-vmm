@@ -7,6 +7,7 @@ pub struct RtcWrapper {
 }
 
 impl RtcWrapper {
+    #[must_use]
     pub fn new() -> Self {
         RtcWrapper { index: 0 }
     }

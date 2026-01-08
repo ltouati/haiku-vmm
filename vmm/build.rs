@@ -12,7 +12,7 @@ fn main() {
     let output_img = project_root.join("debug_initrd.img");
     let init_source = Path::new("init.sh");
 
-    println!("Creating initrd at {:?}", output_img);
+    println!("Creating initrd at {}", output_img.display());
 
     for dir in &["bin", "dev", "proc", "sys", "mnt", "tmp", "etc"] {
         fs::create_dir_all(work_dir.join(dir)).unwrap();
@@ -33,9 +33,7 @@ fn main() {
                 "Failed to execute curl. Please install curl or provide a static busybox binary.",
             );
 
-        if !status.success() {
-            panic!("Failed to download busybox from {}", url);
-        }
+        assert!(status.success(), "Failed to download busybox from {url}");
     }
 
     // Ensure busybox is executable
@@ -52,9 +50,7 @@ fn main() {
             .status()
             .expect("Failed to execute curl for strace");
 
-        if !status.success() {
-            panic!("Failed to download strace from {}", url);
-        }
+        assert!(status.success(), "Failed to download strace from {url}");
     }
     // Ensure strace is executable
     let mut perms = fs::metadata(&strace_path).unwrap().permissions();
@@ -81,7 +77,7 @@ fn main() {
     perms.set_mode(0o755);
     fs::set_permissions(&target_init, perms).unwrap();
     let create_image_script = Path::new("create_image.sh");
-    println!("{:?}", work_dir);
+    println!("{}", work_dir.display());
     // 4. Create the CPIO archive
     // We use a pipe: find . | cpio -o -H newc | gzip > ../debug_initrd.img
     let find_output = Command::new("bash")
@@ -96,7 +92,7 @@ fn main() {
         .current_dir(&work_dir)
         .output()
         .expect("failed to run find");
-    println!("{:?}", find_output);
+    println!("{find_output:?}");
     fs::copy(&output_img, Path::new("../kernels/initrd.img")).expect("failed to copy image");
-    println!("Successfully built initrd: {:?}", output_img);
+    println!("Successfully built initrd: {}", output_img.display());
 }

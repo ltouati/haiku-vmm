@@ -2,7 +2,10 @@ use std::borrow::{Borrow, BorrowMut};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
-use virtio_bindings::virtio_blk::*;
+use virtio_bindings::virtio_blk::{
+    VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_MQ, VIRTIO_BLK_F_SEG_MAX,
+    VIRTIO_BLK_S_OK, virtio_blk_config,
+};
 use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
 use virtio_blk::defs::SECTOR_SHIFT;
 use virtio_blk::request::{Request, RequestType};
@@ -17,7 +20,7 @@ use crate::system::backend::HypervisorBackend;
 use crate::system::vmachine::vcpu::VcpuInjector;
 use std::sync::{Arc, Mutex};
 
-/// VirtIO Block Device using rust-vmm components.
+/// `VirtIO` Block Device using rust-vmm components.
 pub struct BlockDevice<B: HypervisorBackend> {
     config: VirtioConfig<Queue>,
     disk_file: File,
@@ -32,8 +35,7 @@ impl<B: HypervisorBackend> BlockDevice<B> {
         // Block device usually has 1 queue.
 
         let mut queues = Vec::new();
-        queues
-            .push(Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create queue: {:?}", e))?);
+        queues.push(Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create queue: {e:?}"))?);
 
         let metadata = disk_file.metadata()?;
         let disk_size = metadata.len();
@@ -60,7 +62,7 @@ impl<B: HypervisorBackend> BlockDevice<B> {
         // Serialize config to bytes
         let config_space = unsafe {
             std::slice::from_raw_parts(
-                &config as *const _ as *const u8,
+                (&raw const config).cast::<u8>(),
                 std::mem::size_of::<virtio_blk_config>(),
             )
             .to_vec()
@@ -121,8 +123,8 @@ impl<B: HypervisorBackend> BorrowMut<VirtioConfig<Queue>> for BlockDevice<B> {
 
 impl<B: HypervisorBackend> VirtioMmioDevice for BlockDevice<B> {
     fn queue_notify(&mut self, val: u32) {
-        println!("VirtIO Block Notify: {}", val);
-        log::debug!("VirtIO Block Notify: {}", val);
+        println!("VirtIO Block Notify: {val}");
+        log::debug!("VirtIO Block Notify: {val}");
 
         let mem = match self.guest_mem.as_ref() {
             Some(m) => m,
@@ -134,7 +136,7 @@ impl<B: HypervisorBackend> VirtioMmioDevice for BlockDevice<B> {
             while let Some(mut chain) = queue
                 .iter(mem)
                 .map_err(|e| {
-                    log::error!("Failed to get queue iterator: {:?}", e);
+                    log::error!("Failed to get queue iterator: {e:?}");
                     e
                 })
                 .ok()
@@ -143,7 +145,7 @@ impl<B: HypervisorBackend> VirtioMmioDevice for BlockDevice<B> {
                 let request = match Request::parse(&mut chain) {
                     Ok(r) => r,
                     Err(e) => {
-                        log::error!("Failed to parse block request: {}", e);
+                        log::error!("Failed to parse block request: {e}");
                         continue;
                     }
                 };
@@ -166,7 +168,7 @@ impl<B: HypervisorBackend> VirtioMmioDevice for BlockDevice<B> {
 
 impl<B: HypervisorBackend> BlockDevice<B> {
     fn signal_interrupt(&mut self) {
-        default_signal_interrupt(&mut self.config, self.pic.as_ref(), self.irq_line)
+        default_signal_interrupt(&mut self.config, self.pic.as_ref(), self.irq_line);
     }
 
     fn process_request(
@@ -184,15 +186,15 @@ impl<B: HypervisorBackend> BlockDevice<B> {
                 for (addr, len) in request.data() {
                     let mut buf = vec![0u8; *len as usize]; // Inefficient but simple
                     if let Err(e) = disk_file.read_exact_at(&mut buf, offset + total_read) {
-                        log::error!("Read failed: {}", e);
+                        log::error!("Read failed: {e}");
                         break;
                     }
                     // Write to guest
                     if let Err(e) = chain.memory().write_slice(&buf, *addr) {
-                        log::error!("Guest write failed: {:?}", e);
+                        log::error!("Guest write failed: {e:?}");
                         break;
                     }
-                    total_read += *len as u64;
+                    total_read += u64::from(*len);
                 }
                 // Status
                 chain
@@ -211,14 +213,14 @@ impl<B: HypervisorBackend> BlockDevice<B> {
                 for (addr, len) in request.data() {
                     let mut buf = vec![0u8; *len as usize];
                     if let Err(e) = chain.memory().read_slice(&mut buf, *addr) {
-                        log::error!("Guest read failed: {:?}", e);
+                        log::error!("Guest read failed: {e:?}");
                         break;
                     }
                     if let Err(e) = disk_file.write_all_at(&buf, offset + total_written) {
-                        log::error!("Write failed: {}", e);
+                        log::error!("Write failed: {e}");
                         break;
                     }
-                    total_written += *len as u64;
+                    total_written += u64::from(*len);
                 }
                 chain
                     .memory()
@@ -238,7 +240,7 @@ impl<B: HypervisorBackend> BlockDevice<B> {
                 0
             }
             e => {
-                println!("Unsupported request type: {:?}", e);
+                println!("Unsupported request type: {e:?}");
                 0
             }
         }

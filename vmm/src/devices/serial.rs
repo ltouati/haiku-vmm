@@ -35,7 +35,7 @@ impl Trigger for PicTrigger {
     }
 }
 
-/// Trigger that wraps either a NoOp or a PIC IRQ.
+/// Trigger that wraps either a `NoOp` or a PIC IRQ.
 struct SerialTrigger {
     inner: TriggerType,
 }
@@ -61,7 +61,8 @@ pub struct SerialConsole {
 }
 
 impl SerialConsole {
-    /// Create a new SerialConsole instance.
+    /// Create a new `SerialConsole` instance.
+    #[must_use]
     pub fn new(pic: Option<Arc<Mutex<Pic>>>) -> Self {
         // Output to stdout
         let out = Box::new(io::stdout());
@@ -83,7 +84,7 @@ impl SerialConsole {
 
     pub fn queue_input(&mut self, data: &[u8]) {
         if let Err(e) = self.device.enqueue_raw_bytes(data) {
-            log::error!("Failed to enqueue serial input: {:?}", e);
+            log::error!("Failed to enqueue serial input: {e:?}");
         }
     }
 }
@@ -101,7 +102,7 @@ impl MutDevicePio for SerialConsole {
             return;
         }
         if let Err(e) = self.device.write(offset as u8, data[0]) {
-            log::error!("Serial write error: {:?}", e);
+            log::error!("Serial write error: {e:?}");
         }
     }
 }

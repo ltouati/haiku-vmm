@@ -131,18 +131,18 @@ pub trait HypervisorBackend: Send + Sync {
 /// Real NVMM backend implementation.
 pub struct NvmmBackend;
 
-/// Wrapper for NvmmMachine to implement Send
+/// Wrapper for `NvmmMachine` to implement Send
 pub struct NvmmMachineHandle(pub Box<NvmmMachine>);
 unsafe impl Send for NvmmMachineHandle {}
 
-/// Wrapper for NvmmVcpu to implement Send
+/// Wrapper for `NvmmVcpu` to implement Send
 pub struct NvmmVcpuHandle(pub Box<NvmmVcpu>);
 unsafe impl Send for NvmmVcpuHandle {}
 
 fn parse_nvmm_exit(
     exit: &crate::system::nvmm::sys::NvmmX64Exit,
     state: Option<&NvmmX64State>,
-) -> Result<VmExit> {
+) -> VmExit {
     match exit.reason {
         NVMM_EXIT_IO => {
             let io_exit = unsafe { exit.u.io };
@@ -157,13 +157,13 @@ fn parse_nvmm_exit(
                 }
             }
 
-            Ok(VmExit::Io {
+            VmExit::Io {
                 port: io_exit.port,
                 is_in: io_exit.in_,
                 data,
                 op_size: io_exit.operand_size,
                 npc: io_exit.npc,
-            })
+            }
         }
         NVMM_EXIT_MEMORY => {
             let mut value = 0;
@@ -184,7 +184,7 @@ fn parse_nvmm_exit(
                                     value = (full_val >> 8) & 0xFF;
                                 }
                                 _ => value = full_val,
-                            };
+                            }
                         }
                     } else {
                         match op1 {
@@ -203,37 +203,37 @@ fn parse_nvmm_exit(
                     }
                 }
             }
-            Ok(VmExit::Memory {
+            VmExit::Memory {
                 gpa: mem.gpa,
                 is_write,
                 inst_len: mem.inst_len,
                 inst_bytes: mem.inst_bytes,
                 value,
-            })
+            }
         }
         NVMM_EXIT_RDMSR => {
             let msr_exit = unsafe { exit.u.rdmsr };
-            Ok(VmExit::RdMsr {
+            VmExit::RdMsr {
                 msr: msr_exit.msr,
                 npc: msr_exit.npc,
-            })
+            }
         }
         NVMM_EXIT_WRMSR => {
             let msr_exit = unsafe { exit.u.wrmsr };
-            Ok(VmExit::WrMsr {
+            VmExit::WrMsr {
                 msr: msr_exit.msr,
                 val: msr_exit.val,
                 npc: msr_exit.npc,
-            })
+            }
         }
-        NVMM_EXIT_SHUTDOWN => Ok(VmExit::Shutdown),
-        NVMM_EXIT_HALTED => Ok(VmExit::Halted),
-        0xffffffffffffffff => {
+        NVMM_EXIT_SHUTDOWN => VmExit::Shutdown,
+        NVMM_EXIT_HALTED => VmExit::Halted,
+        0xffff_ffff_ffff_ffff => {
             let hw = unsafe { exit.u.inv.hwcode };
-            debug!("NVMM_EXIT_INVALID: hwcode={:#x}", hw);
-            Ok(VmExit::Unknown(0xffffffffffffffff))
+            debug!("NVMM_EXIT_INVALID: hwcode={hw:#x}");
+            VmExit::Unknown(0xffff_ffff_ffff_ffff)
         }
-        r => Ok(VmExit::Unknown(r)),
+        r => VmExit::Unknown(r),
     }
 }
 
@@ -246,11 +246,11 @@ impl HypervisorBackend for NvmmBackend {
     }
 
     unsafe fn machine_destroy(&self, mach: &mut Self::MachineHandle) -> i32 {
-        unsafe { nvmm_machine_destroy(&mut *mach.0) }
+        unsafe { nvmm_machine_destroy(&raw mut *mach.0) }
     }
 
     unsafe fn hva_map(&self, mach: &mut Self::MachineHandle, hva: usize, size: usize) -> i32 {
-        unsafe { nvmm_hva_map(&mut *mach.0, hva, size) }
+        unsafe { nvmm_hva_map(&raw mut *mach.0, hva, size) }
     }
 
     unsafe fn gpa_map(
@@ -261,7 +261,7 @@ impl HypervisorBackend for NvmmBackend {
         size: usize,
         flags: i32,
     ) -> i32 {
-        unsafe { nvmm_gpa_map(&mut *mach.0, hva, gpa, size, flags) }
+        unsafe { nvmm_gpa_map(&raw mut *mach.0, hva, gpa, size, flags) }
     }
 
     unsafe fn vcpu_create(
@@ -270,7 +270,7 @@ impl HypervisorBackend for NvmmBackend {
         cpuid: NvmmCpuid,
         vcpu: &mut Self::VcpuHandle,
     ) -> i32 {
-        unsafe { nvmm_vcpu_create(&mut *mach.0, cpuid, &mut *vcpu.0) }
+        unsafe { nvmm_vcpu_create(&raw mut *mach.0, cpuid, &raw mut *vcpu.0) }
     }
 
     unsafe fn vcpu_destroy(
@@ -278,7 +278,7 @@ impl HypervisorBackend for NvmmBackend {
         mach: &mut Self::MachineHandle,
         vcpu: &mut Self::VcpuHandle,
     ) -> i32 {
-        unsafe { nvmm_vcpu_destroy(&mut *mach.0, &mut *vcpu.0) }
+        unsafe { nvmm_vcpu_destroy(&raw mut *mach.0, &raw mut *vcpu.0) }
     }
 
     unsafe fn vcpu_run(
@@ -286,7 +286,7 @@ impl HypervisorBackend for NvmmBackend {
         mach: &mut Self::MachineHandle,
         vcpu: &mut Self::VcpuHandle,
     ) -> Result<VmExit> {
-        let ret = unsafe { nvmm_vcpu_run(&mut *mach.0, &mut *vcpu.0) };
+        let ret = unsafe { nvmm_vcpu_run(&raw mut *mach.0, &raw mut *vcpu.0) };
         if ret != 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(4) {
@@ -310,7 +310,7 @@ impl HypervisorBackend for NvmmBackend {
             Some(unsafe { &*state_ptr })
         };
 
-        parse_nvmm_exit(&exit, state)
+        Ok(parse_nvmm_exit(&exit, state))
     }
 
     unsafe fn get_vcpu_state(
@@ -319,7 +319,7 @@ impl HypervisorBackend for NvmmBackend {
         vcpu: &mut Self::VcpuHandle,
         flags: u64,
     ) -> Result<NvmmX64State> {
-        let ret = unsafe { nvmm_vcpu_getstate(&mut *mach.0, &mut *vcpu.0, flags) };
+        let ret = unsafe { nvmm_vcpu_getstate(&raw mut *mach.0, &raw mut *vcpu.0, flags) };
         if ret != 0 {
             return Err(io::Error::last_os_error().into());
         }
@@ -344,7 +344,7 @@ impl HypervisorBackend for NvmmBackend {
             return Err(anyhow!("State ptr is null"));
         }
         unsafe { *state_ptr = *state };
-        let ret = unsafe { nvmm_vcpu_setstate(&mut *mach.0, &mut *vcpu.0, flags) };
+        let ret = unsafe { nvmm_vcpu_setstate(&raw mut *mach.0, &raw mut *vcpu.0, flags) };
         if ret != 0 {
             return Err(io::Error::last_os_error().into());
         }
@@ -387,10 +387,10 @@ impl HypervisorBackend for NvmmBackend {
         };
         let ret = unsafe {
             nvmm_vcpu_configure(
-                &mut *mach.0,
-                &mut *vcpu.0,
+                &raw mut *mach.0,
+                &raw mut *vcpu.0,
                 NVMM_VCPU_CONF_CPUID,
-                &conf as *const _ as *mut c_void,
+                &raw const conf as *mut c_void,
             )
         };
         if ret != 0 {
@@ -416,11 +416,11 @@ impl HypervisorBackend for NvmmBackend {
             u: NvmmX64EventUnion { pad: [0; 16] },
         };
         unsafe { *event_ptr = event };
-        unsafe { nvmm_vcpu_inject(&mut *mach.0, &mut *vcpu.0) }
+        unsafe { nvmm_vcpu_inject(&raw mut *mach.0, &raw mut *vcpu.0) }
     }
 
     unsafe fn vcpu_dump(&self, mach: &mut Self::MachineHandle, vcpu: &mut Self::VcpuHandle) {
-        unsafe { nvmm_vcpu_dump(&mut *mach.0, &mut *vcpu.0) }
+        unsafe { nvmm_vcpu_dump(&raw mut *mach.0, &raw mut *vcpu.0) }
     }
 }
 
@@ -519,7 +519,7 @@ impl HypervisorBackend for MockBackend {
                     // For mock, we should interpret the exit struct set by behavior?
                     // But here behavior returns i32.
                     // Parse the exit struct
-                    parse_nvmm_exit(&*exit_ptr, None)
+                    Ok(parse_nvmm_exit(&*exit_ptr, None))
                 } else {
                     return Err(anyhow!("Exit ptr null in mock"));
                 }

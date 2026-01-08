@@ -21,7 +21,7 @@ pub const APIC_TMCCT: u64 = 0x390; // Current Count
 pub const APIC_TDCR: u64 = 0x3E0; // Divide Configuration
 
 // Base Address (Default)
-pub const APIC_BASE: u64 = 0xFEE00000;
+pub const APIC_BASE: u64 = 0xFEE0_0000;
 
 // Timer Modes (Bits 17:18 in LVT Timer)
 pub const APIC_LVT_TIMER_ONESHOT: u32 = 0 << 17;
@@ -42,6 +42,7 @@ impl Default for Lapic {
     }
 }
 impl Lapic {
+    #[must_use]
     pub fn new() -> Self {
         let mut lapic = Lapic {
             regs: [0; 1024],
@@ -112,11 +113,11 @@ impl Lapic {
             let now = Instant::now();
             if now >= expires {
                 return 0;
-            } else {
-                let remaining = expires - now;
-                let ticks = (remaining.as_nanos() as u64 * LAPIC_FREQ_HZ) / 1_000_000_000;
-                return ticks as u32;
             }
+
+            let remaining = expires - now;
+            let ticks = (remaining.as_nanos() as u64 * LAPIC_FREQ_HZ) / 1_000_000_000;
+            return ticks as u32;
         }
         0
     }
@@ -129,7 +130,7 @@ impl Lapic {
         }
         // Period = (Initial * Divide) / Frequency
         // Assuming divide = 1 for simplicity
-        let nanos = (initial_count as u64 * 1_000_000_000) / LAPIC_FREQ_HZ;
+        let nanos = (u64::from(initial_count) * 1_000_000_000) / LAPIC_FREQ_HZ;
         let period = Duration::from_nanos(nanos);
 
         // log::info!("LAPIC Timer Armed: Period = {:?}", period);
@@ -139,6 +140,7 @@ impl Lapic {
         self.timer_last_update = Instant::now();
     }
 
+    #[must_use]
     pub fn peek_timer(&self) -> Option<Instant> {
         self.timer_target_expires
     }

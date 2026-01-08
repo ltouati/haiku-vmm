@@ -1,5 +1,4 @@
 use clap::Parser;
-use deloxide::Deloxide;
 use log::{error, info};
 use std::path::PathBuf;
 use vmm::os::Linux64Guest;
@@ -40,13 +39,6 @@ struct Args {
 // For simplicity and decoupling, I'll keep the small helper here for the SIGHUP dumper.
 
 fn main() -> anyhow::Result<()> {
-    Deloxide::new()
-        .callback(|info| {
-            println!("Deadlock detected! Cycle: {:?}", info.thread_cycle);
-        })
-        .start()
-        .expect("Failed to initialize detector");
-
     env_logger::init();
     let args = Args::parse();
 
@@ -80,7 +72,7 @@ fn main() -> anyhow::Result<()> {
                 &guest_mem_thread,
                 Some(std::path::Path::new("../../kernels/vmlinux")),
             ) {
-                eprintln!("Failed to dump debug state: {}", e);
+                eprintln!("Failed to dump debug state: {e}");
             }
         }
     });
@@ -90,7 +82,7 @@ fn main() -> anyhow::Result<()> {
     // START THE GUEST
     println!("VMM-CLI: Calling guest.run()...");
     if let Err(e) = guest.run(&mut vcpu, &guest_mem) {
-        error!("Guest exited with error: {}", e);
+        error!("Guest exited with error: {e}");
     }
 
     Ok(())
