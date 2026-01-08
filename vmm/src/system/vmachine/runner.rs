@@ -3,20 +3,17 @@ use crate::system::vmachine::regs;
 use crate::system::vmachine::vcpu::{Vcpu, VcpuInjector};
 use crate::types::{VmAction, VmExit};
 use anyhow::{Result, anyhow};
-use futures::future::BoxFuture;
 use iced_x86::{Decoder, DecoderOptions};
 use log::{error, info};
 use std::sync::{Arc, Mutex};
 use vm_device::device_manager::{MmioManager, PioManager};
 
-pub type IoHandler<'b> =
-    dyn FnMut(u16, bool, &[u8], u8, u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
-pub type MemoryHandler<'b> =
-    dyn FnMut(u64, bool, u8, [u8; 15], u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
-pub type ShutdownHandler<'b> = dyn FnMut() -> BoxFuture<'b, Result<VmAction>> + 'b;
-pub type MsrHandler<'b> = dyn FnMut(u32, bool, u64, u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
-pub type UnknownHandler<'b> = dyn FnMut(u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
-pub type PreRunHandler<'b, B> = dyn FnMut(VcpuInjector<B>) -> BoxFuture<'b, Result<()>> + 'b;
+pub type IoHandler<'b> = dyn FnMut(u16, bool, &[u8], u8, u64) -> Result<VmAction> + 'b;
+pub type MemoryHandler<'b> = dyn FnMut(u64, bool, u8, [u8; 15], u64) -> Result<VmAction> + 'b;
+pub type ShutdownHandler<'b> = dyn FnMut() -> Result<VmAction> + 'b;
+pub type MsrHandler<'b> = dyn FnMut(u32, bool, u64, u64) -> Result<VmAction> + 'b;
+pub type UnknownHandler<'b> = dyn FnMut(u64) -> Result<VmAction> + 'b;
+pub type PreRunHandler<'b, B> = dyn FnMut(VcpuInjector<B>) -> Result<()> + 'b;
 
 pub struct VcpuRunner<'a, 'b, B: HypervisorBackend> {
     vcpu: &'b mut Vcpu<'a, B>,
@@ -40,7 +37,7 @@ impl<'a, 'b, B: HypervisorBackend> VcpuRunner<'a, 'b, B> {
             msr_handler: Self::create_msr_handler(),
             memory_handler: Self::create_memory_handler(device_mgr_mem),
             unknown_handler: Self::create_unknown_handler(),
-            pre_run_handler: Box::new(|_| Box::pin(async { Ok(()) })),
+            pre_run_handler: Box::new(|_| Ok(())),
         }
     }
 
@@ -50,64 +47,59 @@ impl<'a, 'b, B: HypervisorBackend> VcpuRunner<'a, 'b, B> {
         Box::new(move |port, is_in, data, op_size, npc| {
             let device_mgr = device_mgr.clone();
             let data = data.to_vec();
-            Box::pin(async move {
-                if !is_in {
-                    // Write
-                    // Ignore errors (e.g. unmapped ports)
-                    let _ = device_mgr
-                        .lock()
-                        .map_err(|_| anyhow!("Failed to lock device manager"))?
-                        .pio_write(vm_device::bus::PioAddress(port), &data);
 
-                    Ok(VmAction::SetRip(npc))
-                } else {
-                    // Read
-                    // Default to 0xFF (Unmapped)
-                    let mut read_data = vec![0xffu8; op_size as usize];
+            if !is_in {
+                // Write
+                // Ignore errors (e.g. unmapped ports)
+                let _ = device_mgr
+                    .lock()
+                    .map_err(|_| anyhow!("Failed to lock device manager"))?
+                    .pio_write(vm_device::bus::PioAddress(port), &data);
 
-                    // Attempt read, ignore errors
-                    let _ = device_mgr
-                        .lock()
-                        .map_err(|_| anyhow!("Failed to lock device manager"))?
-                        .pio_read(vm_device::bus::PioAddress(port), &mut read_data);
+                Ok(VmAction::SetRip(npc))
+            } else {
+                // Read
+                // Default to 0xFF (Unmapped)
+                let mut read_data = vec![0xffu8; op_size as usize];
 
-                    let mut val = 0u64;
-                    for (i, byte) in read_data.iter().enumerate() {
-                        val |= (*byte as u64) << (i * 8);
-                    }
+                // Attempt read, ignore errors
+                let _ = device_mgr
+                    .lock()
+                    .map_err(|_| anyhow!("Failed to lock device manager"))?
+                    .pio_read(vm_device::bus::PioAddress(port), &mut read_data);
 
-                    let mask = if op_size >= 8 {
-                        0xffff_ffff_ffff_ffff
-                    } else {
-                        (1u64 << (op_size * 8)) - 1
-                    };
-
-                    Ok(VmAction::WriteRegMasked {
-                        reg: regs::GPR_RAX,
-                        val,
-                        mask,
-                        next_rip: npc,
-                    })
+                let mut val = 0u64;
+                for (i, byte) in read_data.iter().enumerate() {
+                    val |= (*byte as u64) << (i * 8);
                 }
-            })
+
+                let mask = if op_size >= 8 {
+                    0xffff_ffff_ffff_ffff
+                } else {
+                    (1u64 << (op_size * 8)) - 1
+                };
+
+                Ok(VmAction::WriteRegMasked {
+                    reg: regs::GPR_RAX,
+                    val,
+                    mask,
+                    next_rip: npc,
+                })
+            }
         })
     }
 
     fn create_shutdown_handler() -> Box<ShutdownHandler<'b>> {
         Box::new(|| {
-            Box::pin(async move {
-                info!("VM Shutdown");
-                Ok(VmAction::Shutdown)
-            })
+            info!("VM Shutdown");
+            Ok(VmAction::Shutdown)
         })
     }
 
     fn create_msr_handler() -> Box<MsrHandler<'b>> {
         Box::new(|msr, is_write, _, _| {
-            Box::pin(async move {
-                info!("Unhandled MSR Exit: msr={:#x}, is_write={}", msr, is_write);
-                Ok(VmAction::Continue)
-            })
+            info!("Unhandled MSR Exit: msr={:#x}, is_write={}", msr, is_write);
+            Ok(VmAction::Continue)
         })
     }
 
@@ -116,142 +108,139 @@ impl<'a, 'b, B: HypervisorBackend> VcpuRunner<'a, 'b, B> {
     ) -> Box<MemoryHandler<'b>> {
         Box::new(move |gpa, is_write, inst_len, inst_bytes, value| {
             let device_mgr = device_mgr.clone();
-            Box::pin(async move {
-                let inst_slice = &inst_bytes[..inst_len as usize];
-                let mut decoder = Decoder::with_ip(64, inst_slice, 0, DecoderOptions::NONE);
-                let instruction = decoder.iter().next();
-                let size = instruction.map(|i| i.memory_size().size()).unwrap_or(4);
-                let (reg, mask) = instruction
-                    .and_then(|i| {
-                        if !is_write {
-                            let op0 = i.op0_register();
-                            let gpr = regs::reg_to_gpr(op0);
-                            // Determine size/mask
-                            use iced_x86::Register;
-                            let mask = match op0 {
-                                // 8-bit
-                                Register::AL
-                                | Register::CL
-                                | Register::DL
-                                | Register::BL
-                                | Register::SPL
-                                | Register::BPL
-                                | Register::SIL
-                                | Register::DIL
-                                | Register::R8L
-                                | Register::R9L
-                                | Register::R10L
-                                | Register::R11L
-                                | Register::R12L
-                                | Register::R13L
-                                | Register::R14L
-                                | Register::R15L
-                                | Register::AH
-                                | Register::CH
-                                | Register::DH
-                                | Register::BH => 0xFFu64,
-                                // 16-bit
-                                Register::AX
-                                | Register::CX
-                                | Register::DX
-                                | Register::BX
-                                | Register::SP
-                                | Register::BP
-                                | Register::SI
-                                | Register::DI
-                                | Register::R8W
-                                | Register::R9W
-                                | Register::R10W
-                                | Register::R11W
-                                | Register::R12W
-                                | Register::R13W
-                                | Register::R14W
-                                | Register::R15W => 0xFFFFu64,
-                                // 32-bit (zero extend to 64)
-                                Register::EAX
-                                | Register::ECX
-                                | Register::EDX
-                                | Register::EBX
-                                | Register::ESP
-                                | Register::EBP
-                                | Register::ESI
-                                | Register::EDI
-                                | Register::R8D
-                                | Register::R9D
-                                | Register::R10D
-                                | Register::R11D
-                                | Register::R12D
-                                | Register::R13D
-                                | Register::R14D
-                                | Register::R15D => 0xFFFF_FFFF_FFFF_FFFF,
-                                // 64-bit
-                                _ => 0xFFFF_FFFF_FFFF_FFFF,
-                            };
-                            Some((gpr, mask))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or((regs::GPR_RAX, 0xFFFF_FFFF_FFFF_FFFF));
 
-                log::debug!(
-                    "MMIO: gpa={:#x}, is_write={}, size={}, reg={}, inst={:?}",
-                    gpa,
-                    is_write,
-                    size,
+            let inst_slice = &inst_bytes[..inst_len as usize];
+            let mut decoder = Decoder::with_ip(64, inst_slice, 0, DecoderOptions::NONE);
+            let instruction = decoder.iter().next();
+            let size = instruction.map(|i| i.memory_size().size()).unwrap_or(4);
+            let (reg, mask) = instruction
+                .and_then(|i| {
+                    if !is_write {
+                        let op0 = i.op0_register();
+                        let gpr = regs::reg_to_gpr(op0);
+                        // Determine size/mask
+                        use iced_x86::Register;
+                        let mask = match op0 {
+                            // 8-bit
+                            Register::AL
+                            | Register::CL
+                            | Register::DL
+                            | Register::BL
+                            | Register::SPL
+                            | Register::BPL
+                            | Register::SIL
+                            | Register::DIL
+                            | Register::R8L
+                            | Register::R9L
+                            | Register::R10L
+                            | Register::R11L
+                            | Register::R12L
+                            | Register::R13L
+                            | Register::R14L
+                            | Register::R15L
+                            | Register::AH
+                            | Register::CH
+                            | Register::DH
+                            | Register::BH => 0xFFu64,
+                            // 16-bit
+                            Register::AX
+                            | Register::CX
+                            | Register::DX
+                            | Register::BX
+                            | Register::SP
+                            | Register::BP
+                            | Register::SI
+                            | Register::DI
+                            | Register::R8W
+                            | Register::R9W
+                            | Register::R10W
+                            | Register::R11W
+                            | Register::R12W
+                            | Register::R13W
+                            | Register::R14W
+                            | Register::R15W => 0xFFFFu64,
+                            // 32-bit (zero extend to 64)
+                            Register::EAX
+                            | Register::ECX
+                            | Register::EDX
+                            | Register::EBX
+                            | Register::ESP
+                            | Register::EBP
+                            | Register::ESI
+                            | Register::EDI
+                            | Register::R8D
+                            | Register::R9D
+                            | Register::R10D
+                            | Register::R11D
+                            | Register::R12D
+                            | Register::R13D
+                            | Register::R14D
+                            | Register::R15D => 0xFFFF_FFFF_FFFF_FFFF,
+                            // 64-bit
+                            _ => 0xFFFF_FFFF_FFFF_FFFF,
+                        };
+                        Some((gpr, mask))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or((regs::GPR_RAX, 0xFFFF_FFFF_FFFF_FFFF));
+
+            log::debug!(
+                "MMIO: gpa={:#x}, is_write={}, size={}, reg={}, inst={:?}",
+                gpa,
+                is_write,
+                size,
+                reg,
+                instruction
+            );
+
+            if is_write {
+                // Write
+                let val_bytes = value.to_le_bytes();
+                device_mgr
+                    .lock()
+                    .map_err(|_| anyhow!("Failed to lock device manager"))?
+                    .mmio_write(vm_device::bus::MmioAddress(gpa), &val_bytes[..size])
+                    .map_err(|e| {
+                        anyhow!(
+                            "MMIO Write Error: gpa={:#x}, val={:#x}, error={:?}",
+                            gpa,
+                            value,
+                            e
+                        )
+                    })?;
+                Ok(VmAction::AdvanceRip(inst_len as u64))
+            } else {
+                // Read
+                let mut data = [0u8; 8];
+                device_mgr
+                    .lock()
+                    .map_err(|_| anyhow!("Failed to lock device manager"))?
+                    .mmio_read(vm_device::bus::MmioAddress(gpa), &mut data[..size])
+                    .map_err(|e| anyhow!("MMIO Read Error: gpa={:#x}, error={:?}", gpa, e))?;
+                let val = u64::from_le_bytes(data);
+
+                Ok(VmAction::WriteRegAndContinue {
                     reg,
-                    instruction
-                );
-
-                if is_write {
-                    // Write
-                    let val_bytes = value.to_le_bytes();
-                    device_mgr
-                        .lock()
-                        .map_err(|_| anyhow!("Failed to lock device manager"))?
-                        .mmio_write(vm_device::bus::MmioAddress(gpa), &val_bytes[..size])
-                        .map_err(|e| {
-                            anyhow!(
-                                "MMIO Write Error: gpa={:#x}, val={:#x}, error={:?}",
-                                gpa,
-                                value,
-                                e
-                            )
-                        })?;
-                    Ok(VmAction::AdvanceRip(inst_len as u64))
-                } else {
-                    // Read
-                    let mut data = [0u8; 8];
-                    device_mgr
-                        .lock()
-                        .map_err(|_| anyhow!("Failed to lock device manager"))?
-                        .mmio_read(vm_device::bus::MmioAddress(gpa), &mut data[..size])
-                        .map_err(|e| anyhow!("MMIO Read Error: gpa={:#x}, error={:?}", gpa, e))?;
-                    let val = u64::from_le_bytes(data);
-
-                    Ok(VmAction::WriteRegAndContinue {
-                        reg,
-                        val,
-                        mask,
-                        advance_rip: inst_len as u64,
-                    })
-                }
-            })
+                    val,
+                    mask,
+                    advance_rip: inst_len as u64,
+                })
+            }
         })
     }
 
     fn create_unknown_handler() -> Box<UnknownHandler<'b>> {
         Box::new(|reason| {
-            Box::pin(async move {
-                error!("Unknown VM Exit Reason: {:#x}", reason);
-                Ok(VmAction::Shutdown)
-            })
+            error!("Unknown VM Exit Reason: {:#x}", reason);
+            Ok(VmAction::Shutdown)
         })
     }
 
     pub fn on_io<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(u16, bool, &[u8], u8, u64) -> BoxFuture<'b, Result<VmAction>> + 'b,
+        F: FnMut(u16, bool, &[u8], u8, u64) -> Result<VmAction> + 'b,
     {
         self.io_handler = Box::new(handler);
         self
@@ -259,7 +248,7 @@ impl<'a, 'b, B: HypervisorBackend> VcpuRunner<'a, 'b, B> {
 
     pub fn on_memory<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(u64, bool, u8, [u8; 15], u64) -> BoxFuture<'b, Result<VmAction>> + 'b,
+        F: FnMut(u64, bool, u8, [u8; 15], u64) -> Result<VmAction> + 'b,
     {
         self.memory_handler = Box::new(handler);
         self
@@ -267,7 +256,7 @@ impl<'a, 'b, B: HypervisorBackend> VcpuRunner<'a, 'b, B> {
 
     pub fn on_shutdown<F>(mut self, handler: F) -> Self
     where
-        F: FnMut() -> BoxFuture<'b, Result<VmAction>> + 'b,
+        F: FnMut() -> Result<VmAction> + 'b,
     {
         self.shutdown_handler = Box::new(handler);
         self
@@ -275,7 +264,7 @@ impl<'a, 'b, B: HypervisorBackend> VcpuRunner<'a, 'b, B> {
 
     pub fn on_msr<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(u32, bool, u64, u64) -> BoxFuture<'b, Result<VmAction>> + 'b,
+        F: FnMut(u32, bool, u64, u64) -> Result<VmAction> + 'b,
     {
         self.msr_handler = Box::new(handler);
         self
@@ -283,7 +272,7 @@ impl<'a, 'b, B: HypervisorBackend> VcpuRunner<'a, 'b, B> {
 
     pub fn on_unknown<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(u64) -> BoxFuture<'b, Result<VmAction>> + 'b,
+        F: FnMut(u64) -> Result<VmAction> + 'b,
     {
         self.unknown_handler = Box::new(handler);
         self
@@ -291,17 +280,17 @@ impl<'a, 'b, B: HypervisorBackend> VcpuRunner<'a, 'b, B> {
 
     pub fn on_pre_run<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(VcpuInjector<B>) -> BoxFuture<'b, Result<()>> + 'b,
+        F: FnMut(VcpuInjector<B>) -> Result<()> + 'b,
     {
         self.pre_run_handler = Box::new(handler);
         self
     }
 
-    pub async fn run(mut self) -> Result<()> {
+    pub fn run(mut self) -> Result<()> {
         use log::error;
         loop {
             // Execute Pre-Run Hook (e.g., Interrupt Injection)
-            (self.pre_run_handler)(self.vcpu.injector()).await?;
+            (self.pre_run_handler)(self.vcpu.injector())?;
 
             let exit = self.vcpu.run()?;
             let action = match exit {
@@ -311,21 +300,21 @@ impl<'a, 'b, B: HypervisorBackend> VcpuRunner<'a, 'b, B> {
                     ref data,
                     op_size,
                     npc,
-                } => (self.io_handler)(port, is_in, data, op_size, npc).await?,
+                } => (self.io_handler)(port, is_in, data, op_size, npc)?,
                 VmExit::Memory {
                     gpa,
                     is_write,
                     inst_len,
                     inst_bytes,
                     value,
-                } => (self.memory_handler)(gpa, is_write, inst_len, inst_bytes, value).await?,
+                } => (self.memory_handler)(gpa, is_write, inst_len, inst_bytes, value)?,
                 VmExit::Shutdown => {
                     let rip = self.vcpu.get_rip().unwrap_or(0);
                     error!("VM Shutdown detected at RIP={:#x}", rip);
-                    (self.shutdown_handler)().await?
+                    (self.shutdown_handler)()?
                 }
-                VmExit::RdMsr { msr, npc } => (self.msr_handler)(msr, false, 0, npc).await?,
-                VmExit::WrMsr { msr, val, npc } => (self.msr_handler)(msr, true, val, npc).await?,
+                VmExit::RdMsr { msr, npc } => (self.msr_handler)(msr, false, 0, npc)?,
+                VmExit::WrMsr { msr, val, npc } => (self.msr_handler)(msr, true, val, npc)?,
                 VmExit::Interrupted => VmAction::Continue, // Just loop back to pre-run
 
                 VmExit::Halted => VmAction::Continue,
@@ -333,7 +322,7 @@ impl<'a, 'b, B: HypervisorBackend> VcpuRunner<'a, 'b, B> {
                 VmExit::Unknown(reason) => {
                     let rip = self.vcpu.get_rip().unwrap_or(0);
                     error!("Unknown Exit {:#x} at RIP={:#x}", reason, rip);
-                    (self.unknown_handler)(reason).await?
+                    (self.unknown_handler)(reason)?
                 }
             };
 
@@ -403,8 +392,8 @@ mod tests {
     };
     use std::sync::Arc;
 
-    #[tokio::test]
-    async fn test_runner_io() {
+    #[test]
+    fn test_runner_io() {
         // Setup Backend
         let backend = Arc::new(MockBackend::new());
 
@@ -461,23 +450,21 @@ mod tests {
         let runner = VcpuRunner::new(&mut vcpu)
             .on_io(move |port, is_in, _, _, _| {
                 let io_called = io_called_clone.clone();
-                Box::pin(async move {
-                    assert_eq!(port, 0x80);
-                    assert!(!is_in);
-                    *io_called.lock().unwrap() = true;
-                    Ok(VmAction::Continue)
-                })
+                assert_eq!(port, 0x80);
+                assert!(!is_in);
+                *io_called.lock().unwrap() = true;
+                Ok(VmAction::Continue)
             })
-            .on_shutdown(|| Box::pin(async { Ok(VmAction::Shutdown) }));
+            .on_shutdown(|| Ok(VmAction::Shutdown));
 
         // Run
-        runner.run().await.unwrap();
+        runner.run().unwrap();
 
         assert!(*io_called.lock().unwrap());
     }
 
-    #[tokio::test]
-    async fn test_runner_mmio() {
+    #[test]
+    fn test_runner_mmio() {
         let backend = Arc::new(MockBackend::new());
 
         // Queue Run Behaviors
@@ -526,22 +513,20 @@ mod tests {
         let runner = VcpuRunner::new(&mut vcpu)
             .on_memory(move |gpa, is_write, _, _, _| {
                 let mmio_called = mmio_called_clone.clone();
-                Box::pin(async move {
-                    assert_eq!(gpa, 0x1000);
-                    assert!(is_write);
-                    *mmio_called.lock().unwrap() = true;
-                    Ok(VmAction::Continue)
-                })
+                assert_eq!(gpa, 0x1000);
+                assert!(is_write);
+                *mmio_called.lock().unwrap() = true;
+                Ok(VmAction::Continue)
             })
-            .on_shutdown(|| Box::pin(async { Ok(VmAction::Shutdown) }));
+            .on_shutdown(|| Ok(VmAction::Shutdown));
 
-        runner.run().await.unwrap();
+        runner.run().unwrap();
 
         assert!(*mmio_called.lock().unwrap());
     }
 
-    #[tokio::test]
-    async fn test_runner_shutdown() {
+    #[test]
+    fn test_runner_shutdown() {
         let backend = Arc::new(MockBackend::new());
 
         // Queue Shutdown immediately
@@ -577,13 +562,11 @@ mod tests {
 
         let runner = VcpuRunner::new(&mut vcpu).on_shutdown(move || {
             let shutdown_called = shutdown_called_clone.clone();
-            Box::pin(async move {
-                *shutdown_called.lock().unwrap() = true;
-                Ok(VmAction::Shutdown)
-            })
+            *shutdown_called.lock().unwrap() = true;
+            Ok(VmAction::Shutdown)
         });
 
-        runner.run().await.unwrap();
+        runner.run().unwrap();
         assert!(*shutdown_called.lock().unwrap());
     }
 }

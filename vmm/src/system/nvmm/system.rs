@@ -12,6 +12,11 @@ pub struct NVMMSystem;
 
 impl NVMMSystem {
     pub fn new() -> Result<Self> {
+        if cfg!(not(any(target_os = "netbsd", target_os = "haiku"))) {
+            return Err(anyhow::anyhow!(
+                "NVMM is only supported on NetBSD and Haiku. KVM support is not yet implemented."
+            ));
+        }
         unsafe {
             debug!("Calling nvmm_init...");
             let ret = nvmm_init();

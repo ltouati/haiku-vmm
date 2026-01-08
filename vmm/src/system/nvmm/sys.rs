@@ -312,6 +312,7 @@ pub const NVMM_X64_STATE_ALL: u64 = NVMM_X64_STATE_SEGS
     | NVMM_X64_STATE_INTR
     | NVMM_X64_STATE_FPU;
 
+#[cfg(any(target_os = "netbsd", target_os = "haiku"))]
 #[link(name = "nvmm")]
 unsafe extern "C" {
     pub fn nvmm_init() -> c_int;
@@ -343,3 +344,77 @@ unsafe extern "C" {
     pub fn nvmm_vcpu_inject(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu) -> c_int;
     pub fn nvmm_vcpu_dump(mach: *mut NvmmMachine, vcpu: *mut NvmmVcpu);
 }
+
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_init() -> c_int {
+    -1
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_machine_create(_mach: *mut NvmmMachine) -> c_int {
+    -1
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_machine_destroy(_mach: *mut NvmmMachine) -> c_int {
+    0
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_vcpu_create(
+    _mach: *mut NvmmMachine,
+    _cpuid: NvmmCpuid,
+    _vcpu: *mut NvmmVcpu,
+) -> c_int {
+    -1
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_vcpu_destroy(_mach: *mut NvmmMachine, _vcpu: *mut NvmmVcpu) -> c_int {
+    0
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_vcpu_configure(
+    _mach: *mut NvmmMachine,
+    _vcpu: *mut NvmmVcpu,
+    _key: u64,
+    _value: *mut c_void,
+) -> c_int {
+    0
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_vcpu_run(_mach: *mut NvmmMachine, _vcpu: *mut NvmmVcpu) -> c_int {
+    -1
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_hva_map(_mach: *mut NvmmMachine, _hva: uintptr_t, _size: size_t) -> c_int {
+    0
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_gpa_map(
+    _mach: *mut NvmmMachine,
+    _hva: uintptr_t,
+    _gpa: GpAddr,
+    _size: size_t,
+    _flags: c_int,
+) -> c_int {
+    0
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_vcpu_getstate(
+    _mach: *mut NvmmMachine,
+    _vcpu: *mut NvmmVcpu,
+    _flags: u64,
+) -> c_int {
+    -1
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_vcpu_setstate(
+    _mach: *mut NvmmMachine,
+    _vcpu: *mut NvmmVcpu,
+    _flags: u64,
+) -> c_int {
+    0
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_vcpu_inject(_mach: *mut NvmmMachine, _vcpu: *mut NvmmVcpu) -> c_int {
+    -1
+}
+#[cfg(not(any(target_os = "netbsd", target_os = "haiku")))]
+pub unsafe fn nvmm_vcpu_dump(_mach: *mut NvmmMachine, _vcpu: *mut NvmmVcpu) {}

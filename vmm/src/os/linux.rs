@@ -427,7 +427,7 @@ impl Linux64Guest {
         Ok(vcpu)
     }
 
-    pub async fn run<'a, B: HypervisorBackend + 'static>(
+    pub fn run<'a, B: HypervisorBackend + 'static>(
         &self,
         vcpu: &mut Vcpu<'a, B>,
         guest_mem: &GuestMemoryMmap,
@@ -782,22 +782,22 @@ impl Linux64Guest {
                 let device_mgr = device_mgr_io.clone();
                 let data = data.to_vec();
                 let reset_evt = reset_evt_clone.clone();
-                Box::pin(async move {
-                    // Check Reset First? No, usually after IO or during.
-                    // But here the IO *causes* the reset.
 
-                    if !is_in {
-                        // Write
-                        // Ignore errors (e.g. unmapped ports)
-                        let _ = device_mgr
-                            .lock()
-                            .map_err(|_| anyhow!("Failed to lock device manager"))?
-                            .pio_write(vm_device::bus::PioAddress(port), &data);
-                        // CHECK RESET SIGNAL
-                        if reset_evt.load(Ordering::SeqCst) {
-                            info!("Reset Signal Detected!");
-                            return Ok(VmAction::Shutdown);
-                        }
+                // Check Reset First? No, usually after IO or during.
+                // But here the IO *causes* the reset.
+
+                if !is_in {
+                    // Write
+                    // Ignore errors (e.g. unmapped ports)
+                    let _ = device_mgr
+                        .lock()
+                        .map_err(|_| anyhow!("Failed to lock device manager"))?
+                        .pio_write(vm_device::bus::PioAddress(port), &data);
+                    // CHECK RESET SIGNAL
+                    if reset_evt.load(Ordering::SeqCst) {
+                        info!("Reset Signal Detected!");
+                        return Ok(VmAction::Shutdown);
+                    }
 
                         Ok(VmAction::SetRip(npc))
                     } else {
@@ -828,7 +828,6 @@ impl Linux64Guest {
                             next_rip: npc,
                         })
                     }
-                })
             })
             // Robust Memory Handler (LAPIC Fix)
             .on_memory(move |gpa, is_write, inst_len, inst_bytes, value| {
@@ -836,8 +835,7 @@ impl Linux64Guest {
                 let guest_mem = guest_mem_handler.clone();
                 let injector = injector_handler.clone();
 
-                Box::pin(async move {
-                    let (final_len, reg, size, fallback_val) = if inst_len > 0 {
+                let (final_len, reg, size, fallback_val) = if inst_len > 0 {
                         let inst_slice = &inst_bytes[..inst_len as usize];
                         let mut decoder = Decoder::with_ip(64, inst_slice, 0, DecoderOptions::NONE);
                         let instruction = decoder.iter().next();
@@ -935,14 +933,12 @@ impl Linux64Guest {
                             advance_rip: final_len,
                         })
                     }
-                })
             })
             // Robust MSR Handler (Advance on Unknown)
             .on_msr(move |msr, is_write, val, npc| {
                 let apic_base = apic_base_msr.clone();
                 let injector = injector_msr.clone();
-                Box::pin(async move {
-                    if msr == 0x1B {
+                if msr == 0x1B {
                         if is_write { *apic_base.lock().expect("Poisoned lock") = val; }
                         return Ok(VmAction::SetRip(npc));
                     }
@@ -1063,12 +1059,10 @@ impl Linux64Guest {
                     } else {
                         Ok(VmAction::SetRip(npc))
                     }
-                })
             })
             .on_pre_run(move |mut injector| {
                 let lapic = lapic.clone();
                 let pic = pic.clone();
-                Box::pin(async move {
                     // Optimized Injection: Only check state if pending interrupts exist
                     let timer_peek = lapic.lock().expect("Poisoned").peek_timer();
                     let pic_pending = pic.lock().expect("Poisoned").peek_external_interrupt();
@@ -1095,16 +1089,12 @@ impl Linux64Guest {
                         }
                     }
                     Ok(())
-                })
             })
             .on_unknown(|reason| {
-                Box::pin(async move {
-                    error!("Unknown VM Exit Reason: {:#x}", reason);
-                    Ok(VmAction::Shutdown)
-                })
+                error!("Unknown VM Exit Reason: {:#x}", reason);
+                Ok(VmAction::Shutdown)
             })
             .run()
-            .await
     }
 }
 

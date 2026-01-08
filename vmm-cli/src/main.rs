@@ -39,8 +39,7 @@ struct Args {
 // we must re-implement it briefly here or make it public in `linux.rs`.
 // For simplicity and decoupling, I'll keep the small helper here for the SIGHUP dumper.
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     Deloxide::new()
         .callback(|info| {
             println!("Deadlock detected! Cycle: {:?}", info.thread_cycle);
@@ -90,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
 
     // START THE GUEST
     println!("VMM-CLI: Calling guest.run()...");
-    if let Err(e) = guest.run(&mut vcpu, &guest_mem).await {
+    if let Err(e) = guest.run(&mut vcpu, &guest_mem) {
         error!("Guest exited with error: {}", e);
     }
 
