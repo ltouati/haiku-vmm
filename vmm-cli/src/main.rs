@@ -1,8 +1,10 @@
 use clap::Parser;
+use deloxide::Deloxide;
 use log::{error, info};
 use std::path::PathBuf;
-use vmm::Linux64Guest;
-use vmm::NvmmSystem;
+use vmm::os::Linux64Guest;
+use vmm::system::VmmSystem;
+use vmm::system::nvmm::system::NVMMSystem;
 
 /// Simple VMM to boot Linux
 #[derive(Parser, Debug)]
@@ -39,11 +41,18 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    Deloxide::new()
+        .callback(|info| {
+            println!("Deadlock detected! Cycle: {:?}", info.thread_cycle);
+        })
+        .start()
+        .expect("Failed to initialize detector");
+
     env_logger::init();
     let args = Args::parse();
 
     info!("Initialize NVMM...");
-    let sys = NvmmSystem::new()?;
+    let sys = NVMMSystem::new()?;
     let mut machine = sys.create_machine()?;
 
     // Use Linux64Guest to setup the machine

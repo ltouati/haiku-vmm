@@ -5,12 +5,12 @@ use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
 use virtio_device::{VirtioConfig, VirtioDeviceActions, VirtioDeviceType, VirtioMmioDevice};
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 
-
 use vm_memory::{Address, Bytes, GuestMemoryMmap};
 
-use crate::VcpuInjector;
 use crate::devices::pic::Pic;
-use crate::devices::virtio::DeviceType;
+use crate::devices::virtio::{DeviceType, default_signal_interrupt};
+use crate::system::backend::HypervisorBackend;
+use crate::system::vmachine::vcpu::VcpuInjector;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 
@@ -18,19 +18,20 @@ use rand::{RngCore, SeedableRng};
 const CHUNK_SIZE: usize = 64;
 
 /// VirtIO RNG Device
-pub struct RngDevice {
+pub struct RngDevice<B: HypervisorBackend> {
     config: VirtioConfig<Queue>,
     rng_source: StdRng,
     guest_mem: Option<GuestMemoryMmap>,
-    injector: Option<VcpuInjector>,
+    injector: Option<VcpuInjector<B>>,
     pic: Option<Arc<Mutex<Pic>>>,
     irq_line: u8,
 }
 
-impl RngDevice {
+impl<B: HypervisorBackend> RngDevice<B> {
     pub fn new() -> anyhow::Result<Self> {
         let mut queues = Vec::new();
-        queues.push(Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create queue: {:?}", e))?);
+        queues
+            .push(Queue::new(256).map_err(|e| anyhow::anyhow!("Failed to create queue: {:?}", e))?);
 
         let config_space = Vec::new();
         let mut device_features = 0u64;
@@ -52,7 +53,7 @@ impl RngDevice {
         self.guest_mem = Some(mem);
     }
 
-    pub fn set_injector(&mut self, injector: VcpuInjector, pic: Arc<Mutex<Pic>>, line: u8) {
+    pub fn set_injector(&mut self, injector: VcpuInjector<B>, pic: Arc<Mutex<Pic>>, line: u8) {
         self.injector = Some(injector);
         self.pic = Some(pic);
         self.irq_line = line;
@@ -112,17 +113,18 @@ impl RngDevice {
 
         Ok(needs_interrupt)
     }
+    fn signal_interrupt(&mut self) {
+        default_signal_interrupt(&mut self.config, self.pic.as_ref(), self.irq_line)
+    }
 }
 
-
-
-impl VirtioDeviceType for RngDevice {
+impl<B: HypervisorBackend> VirtioDeviceType for RngDevice<B> {
     fn device_type(&self) -> u32 {
         DeviceType::Rng as u32
     }
 }
 
-impl VirtioDeviceActions for RngDevice {
+impl<B: HypervisorBackend> VirtioDeviceActions for RngDevice<B> {
     type E = anyhow::Error;
 
     fn activate(&mut self) -> anyhow::Result<()> {
@@ -136,29 +138,28 @@ impl VirtioDeviceActions for RngDevice {
     }
 }
 
-impl Borrow<VirtioConfig<Queue>> for RngDevice {
+impl<B: HypervisorBackend> Borrow<VirtioConfig<Queue>> for RngDevice<B> {
     fn borrow(&self) -> &VirtioConfig<Queue> {
         &self.config
     }
 }
 
-impl BorrowMut<VirtioConfig<Queue>> for RngDevice {
+impl<B: HypervisorBackend> BorrowMut<VirtioConfig<Queue>> for RngDevice<B> {
     fn borrow_mut(&mut self) -> &mut VirtioConfig<Queue> {
         &mut self.config
     }
 }
 
-impl VirtioMmioDevice for RngDevice {
+impl<B: HypervisorBackend> VirtioMmioDevice for RngDevice<B> {
     fn queue_notify(&mut self, _val: u32) {
-        match self.process_queue() {
+        println!("VirtIO RNG Notify");
+        let ret = self.process_queue();
+        println!("VirtIO RNG Notify Result: {:?}", ret);
+        match ret {
             Ok(needs_irq) => {
                 if needs_irq {
                     log::debug!("RNG: Signaling Interrupt");
-                    self.config.interrupt_status.store(1, std::sync::atomic::Ordering::SeqCst);
-                    if let Some(mut lock) = self.pic.as_ref().and_then(|p| p.lock().ok()) {
-                        lock.set_irq(self.irq_line, true);
-                        lock.set_irq(self.irq_line, false);
-                    }
+                    self.signal_interrupt();
                 }
             }
             Err(e) => log::error!("RNG queue processing error: {:?}", e),

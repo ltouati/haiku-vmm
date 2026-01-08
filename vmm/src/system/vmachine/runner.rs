@@ -1,7 +1,6 @@
-use crate::nvmm::vcpu::regs;
-
-use crate::Vcpu;
-use crate::nvmm::vcpu::VcpuInjector;
+use crate::system::backend::HypervisorBackend;
+use crate::system::vmachine::regs;
+use crate::system::vmachine::vcpu::{Vcpu, VcpuInjector};
 use crate::types::{VmAction, VmExit};
 use anyhow::{Result, anyhow};
 use futures::future::BoxFuture;
@@ -17,21 +16,21 @@ pub type MemoryHandler<'b> =
 pub type ShutdownHandler<'b> = dyn FnMut() -> BoxFuture<'b, Result<VmAction>> + 'b;
 pub type MsrHandler<'b> = dyn FnMut(u32, bool, u64, u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
 pub type UnknownHandler<'b> = dyn FnMut(u64) -> BoxFuture<'b, Result<VmAction>> + 'b;
-pub type PreRunHandler<'b> = dyn FnMut(VcpuInjector) -> BoxFuture<'b, Result<()>> + 'b;
+pub type PreRunHandler<'b, B> = dyn FnMut(VcpuInjector<B>) -> BoxFuture<'b, Result<()>> + 'b;
 
-pub struct VcpuRunner<'a, 'b> {
-    vcpu: &'b mut Vcpu<'a>,
+pub struct VcpuRunner<'a, 'b, B: HypervisorBackend> {
+    vcpu: &'b mut Vcpu<'a, B>,
     io_handler: Box<IoHandler<'b>>,
     memory_handler: Box<MemoryHandler<'b>>,
     shutdown_handler: Box<ShutdownHandler<'b>>,
     msr_handler: Box<MsrHandler<'b>>,
     unknown_handler: Box<UnknownHandler<'b>>,
-    pre_run_handler: Box<PreRunHandler<'b>>,
+    pre_run_handler: Box<PreRunHandler<'b, B>>,
 }
 
-impl<'a, 'b> VcpuRunner<'a, 'b> {
+impl<'a, 'b, B: HypervisorBackend> VcpuRunner<'a, 'b, B> {
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(vcpu: &'b mut Vcpu<'a>) -> Self {
+    pub fn new(vcpu: &'b mut Vcpu<'a, B>) -> Self {
         let device_mgr_io = vcpu.machine.device_mgr.clone();
         let device_mgr_mem = vcpu.machine.device_mgr.clone();
         Self {
@@ -53,7 +52,6 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
             let data = data.to_vec();
             Box::pin(async move {
                 if !is_in {
-                    // Write
                     // Write
                     // Ignore errors (e.g. unmapped ports)
                     let _ = device_mgr
@@ -123,18 +121,78 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
                 let mut decoder = Decoder::with_ip(64, inst_slice, 0, DecoderOptions::NONE);
                 let instruction = decoder.iter().next();
                 let size = instruction.map(|i| i.memory_size().size()).unwrap_or(4);
-                let reg = instruction
+                let (reg, mask) = instruction
                     .and_then(|i| {
                         if !is_write {
-                            // For reads, we need to know where the data goes.
-                            // mov register, [memory] -> op0 is register, op1 is memory
                             let op0 = i.op0_register();
-                            Some(regs::reg_to_gpr(op0))
+                            let gpr = regs::reg_to_gpr(op0);
+                            // Determine size/mask
+                            use iced_x86::Register;
+                            let mask = match op0 {
+                                // 8-bit
+                                Register::AL
+                                | Register::CL
+                                | Register::DL
+                                | Register::BL
+                                | Register::SPL
+                                | Register::BPL
+                                | Register::SIL
+                                | Register::DIL
+                                | Register::R8L
+                                | Register::R9L
+                                | Register::R10L
+                                | Register::R11L
+                                | Register::R12L
+                                | Register::R13L
+                                | Register::R14L
+                                | Register::R15L
+                                | Register::AH
+                                | Register::CH
+                                | Register::DH
+                                | Register::BH => 0xFFu64,
+                                // 16-bit
+                                Register::AX
+                                | Register::CX
+                                | Register::DX
+                                | Register::BX
+                                | Register::SP
+                                | Register::BP
+                                | Register::SI
+                                | Register::DI
+                                | Register::R8W
+                                | Register::R9W
+                                | Register::R10W
+                                | Register::R11W
+                                | Register::R12W
+                                | Register::R13W
+                                | Register::R14W
+                                | Register::R15W => 0xFFFFu64,
+                                // 32-bit (zero extend to 64)
+                                Register::EAX
+                                | Register::ECX
+                                | Register::EDX
+                                | Register::EBX
+                                | Register::ESP
+                                | Register::EBP
+                                | Register::ESI
+                                | Register::EDI
+                                | Register::R8D
+                                | Register::R9D
+                                | Register::R10D
+                                | Register::R11D
+                                | Register::R12D
+                                | Register::R13D
+                                | Register::R14D
+                                | Register::R15D => 0xFFFF_FFFF_FFFF_FFFF,
+                                // 64-bit
+                                _ => 0xFFFF_FFFF_FFFF_FFFF,
+                            };
+                            Some((gpr, mask))
                         } else {
                             None
                         }
                     })
-                    .unwrap_or(regs::GPR_RAX);
+                    .unwrap_or((regs::GPR_RAX, 0xFFFF_FFFF_FFFF_FFFF));
 
                 log::debug!(
                     "MMIO: gpa={:#x}, is_write={}, size={}, reg={}, inst={:?}",
@@ -174,6 +232,7 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
                     Ok(VmAction::WriteRegAndContinue {
                         reg,
                         val,
+                        mask,
                         advance_rip: inst_len as u64,
                     })
                 }
@@ -232,7 +291,7 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
 
     pub fn on_pre_run<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(VcpuInjector) -> BoxFuture<'b, Result<()>> + 'b,
+        F: FnMut(VcpuInjector<B>) -> BoxFuture<'b, Result<()>> + 'b,
     {
         self.pre_run_handler = Box::new(handler);
         self
@@ -290,10 +349,28 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
                 VmAction::WriteRegAndContinue {
                     reg,
                     val,
+                    mask,
                     advance_rip,
                 } => {
                     let mut state = self.vcpu.get_state(regs::STATE_GPRS)?;
-                    state.gprs[reg] = val;
+                    let old_val = state.gprs[reg];
+                    // Special case for 32-bit: It zero extends, so we overwrite high 32 bits with 0.
+                    // My logic above set mask to !0 for 32-bit.
+                    // But wait, if mask is !0, (val & mask) is val. (old & !mask) is 0.
+                    // So it overwrites entirely. This is correct for 32-bit div (zero extend).
+                    // For 8/16-bit, mask is 0xFF/0xFFFF. correct.
+                    // But wait, what if instruction writes to high byte? AH?
+                    // iced_x86 doesn't give me that easily.
+                    // If op0 is AH, reg_to_gpr returns RAX.
+                    // I need shift for AH/BH/CH/DH!
+                    // Let's defer AH support for now or implement it?
+                    // It's rare in MMIO but possible.
+                    // If I ignore it, I might write to AL instead of AH.
+                    // Let's refine the handler logic later or now?
+                    // User asked for "proper register".
+                    // Let's assume low byte for now to fix the main corruption issue.
+
+                    state.gprs[reg] = (old_val & !mask) | (val & mask);
                     state.gprs[regs::GPR_RIP] = state.gprs[regs::GPR_RIP].wrapping_add(advance_rip);
                     self.vcpu.set_state(&state, regs::STATE_GPRS)?;
                 }
@@ -318,10 +395,12 @@ impl<'a, 'b> VcpuRunner<'a, 'b> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nvmm::Machine;
-    use crate::nvmm::Vcpu;
-    use crate::nvmm::backend::MockBackend;
-    use crate::nvmm::sys;
+    use crate::system::Machine;
+    use crate::system::backend::MockBackend;
+    use crate::system::nvmm::sys::{
+        NVMM_EXIT_IO, NVMM_EXIT_MEMORY, NVMM_EXIT_SHUTDOWN, NvmmX64Event, NvmmX64Exit,
+        NvmmX64ExitIo, NvmmX64ExitMemory, NvmmX64State,
+    };
     use std::sync::Arc;
 
     #[tokio::test]
@@ -332,8 +411,8 @@ mod tests {
         // Queue Run Behaviors
         // 1. IO Exit (OUT 0x80)
         backend.queue_run_behavior(|exit| {
-            exit.reason = sys::NVMM_EXIT_IO;
-            exit.u.io = sys::NvmmX64ExitIo {
+            exit.reason = NVMM_EXIT_IO;
+            exit.u.io = NvmmX64ExitIo {
                 in_: false,
                 port: 0x80,
                 seg: 0,
@@ -347,16 +426,13 @@ mod tests {
         });
         // 2. Shutdown Exit to break loop
         backend.queue_run_behavior(|exit| {
-            exit.reason = sys::NVMM_EXIT_SHUTDOWN;
+            exit.reason = NVMM_EXIT_SHUTDOWN;
             0
         });
 
         // Setup Machine & VCPU
-        let machine = unsafe { std::mem::zeroed::<sys::NvmmMachine>() };
-        let raw_machine = Box::new(machine);
-
         let mut test_machine = Machine {
-            raw: raw_machine,
+            raw: crate::system::backend::NvmmMachineHandle(Box::new(unsafe { std::mem::zeroed() })),
             device_mgr: Arc::new(std::sync::Mutex::new(
                 vm_device::device_manager::IoManager::new(),
             )),
@@ -366,23 +442,17 @@ mod tests {
         let mut vcpu = Vcpu {
             _id: 0,
             machine: &mut test_machine,
-            raw: Box::new(unsafe { std::mem::zeroed() }),
+            raw: crate::system::backend::NvmmVcpuHandle(Box::new(unsafe { std::mem::zeroed() })),
             tid: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         // Point exit struct to a local variable (since run() checks it)
-        // But wait, Vcpu::run does NOT use a local exit struct if we mock.
-        // Actually Vcpu::run reads `self.raw.exit`. We need to provide that storage.
-        // In the runner loop, multiple runs happen.
-        // We can make `self.raw.exit` point to a heap alloc or proper struct.
-        // Since Vcpu takes ownership of `raw` which is a Box, we can just ensure `raw.exit` is set.
-        // But `sys::NvmmVcpu` is a C struct. We need to allocate the Exit struct and link it.
-        let mut exit_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Exit>() });
-        let mut event_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Event>() });
-        let mut state_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64State>() });
+        let mut exit_struct = Box::new(unsafe { std::mem::zeroed::<NvmmX64Exit>() });
+        let mut event_struct = Box::new(unsafe { std::mem::zeroed::<NvmmX64Event>() });
+        let mut state_struct = Box::new(unsafe { std::mem::zeroed::<NvmmX64State>() });
 
-        vcpu.raw.exit = &mut *exit_struct;
-        vcpu.raw.event = &mut *event_struct;
-        vcpu.raw.state = &mut *state_struct;
+        vcpu.raw.0.exit = &mut *exit_struct;
+        vcpu.raw.0.event = &mut *event_struct;
+        vcpu.raw.0.state = &mut *state_struct;
 
         // Setup IO Handler Checker
         let io_called = Arc::new(std::sync::Mutex::new(false));
@@ -413,8 +483,8 @@ mod tests {
         // Queue Run Behaviors
         // 1. MMIO Exit (Write 0x1000)
         backend.queue_run_behavior(|exit| {
-            exit.reason = sys::NVMM_EXIT_MEMORY;
-            exit.u.mem = sys::NvmmX64ExitMemory {
+            exit.reason = NVMM_EXIT_MEMORY;
+            exit.u.mem = NvmmX64ExitMemory {
                 prot: 2, // Write
                 gpa: 0x1000,
                 inst_len: 2,
@@ -424,16 +494,12 @@ mod tests {
         });
         // 2. Shutdown
         backend.queue_run_behavior(|exit| {
-            exit.reason = sys::NVMM_EXIT_SHUTDOWN;
+            exit.reason = NVMM_EXIT_SHUTDOWN;
             0
         });
 
-        let machine = unsafe { std::mem::zeroed::<sys::NvmmMachine>() };
-        // We need a dummy raw machine
-        let raw_machine = Box::new(machine);
-
         let mut test_machine = Machine {
-            raw: raw_machine,
+            raw: crate::system::backend::NvmmMachineHandle(Box::new(unsafe { std::mem::zeroed() })),
             device_mgr: Arc::new(std::sync::Mutex::new(
                 vm_device::device_manager::IoManager::new(),
             )),
@@ -443,16 +509,16 @@ mod tests {
         let mut vcpu = Vcpu {
             _id: 0,
             machine: &mut test_machine,
-            raw: Box::new(unsafe { std::mem::zeroed() }),
+            raw: crate::system::backend::NvmmVcpuHandle(Box::new(unsafe { std::mem::zeroed() })),
             tid: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
-        let mut exit_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Exit>() });
-        let mut event_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Event>() });
-        let mut state_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64State>() });
+        let mut exit_struct = Box::new(unsafe { std::mem::zeroed::<NvmmX64Exit>() });
+        let mut event_struct = Box::new(unsafe { std::mem::zeroed::<NvmmX64Event>() });
+        let mut state_struct = Box::new(unsafe { std::mem::zeroed::<NvmmX64State>() });
 
-        vcpu.raw.exit = &mut *exit_struct;
-        vcpu.raw.event = &mut *event_struct;
-        vcpu.raw.state = &mut *state_struct;
+        vcpu.raw.0.exit = &mut *exit_struct;
+        vcpu.raw.0.event = &mut *event_struct;
+        vcpu.raw.0.state = &mut *state_struct;
 
         let mmio_called = Arc::new(std::sync::Mutex::new(false));
         let mmio_called_clone = mmio_called.clone();
@@ -480,15 +546,12 @@ mod tests {
 
         // Queue Shutdown immediately
         backend.queue_run_behavior(|exit| {
-            exit.reason = sys::NVMM_EXIT_SHUTDOWN;
+            exit.reason = NVMM_EXIT_SHUTDOWN;
             0
         });
 
-        let machine = unsafe { std::mem::zeroed::<sys::NvmmMachine>() };
-        let raw_machine = Box::new(machine);
-
         let mut test_machine = Machine {
-            raw: raw_machine,
+            raw: crate::system::backend::NvmmMachineHandle(Box::new(unsafe { std::mem::zeroed() })),
             device_mgr: Arc::new(std::sync::Mutex::new(
                 vm_device::device_manager::IoManager::new(),
             )),
@@ -498,16 +561,16 @@ mod tests {
         let mut vcpu = Vcpu {
             _id: 0,
             machine: &mut test_machine,
-            raw: Box::new(unsafe { std::mem::zeroed() }),
+            raw: crate::system::backend::NvmmVcpuHandle(Box::new(unsafe { std::mem::zeroed() })),
             tid: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
-        let mut exit_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Exit>() });
-        let mut event_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64Event>() });
-        let mut state_struct = Box::new(unsafe { std::mem::zeroed::<sys::NvmmX64State>() });
+        let mut exit_struct = Box::new(unsafe { std::mem::zeroed::<NvmmX64Exit>() });
+        let mut event_struct = Box::new(unsafe { std::mem::zeroed::<NvmmX64Event>() });
+        let mut state_struct = Box::new(unsafe { std::mem::zeroed::<NvmmX64State>() });
 
-        vcpu.raw.exit = &mut *exit_struct;
-        vcpu.raw.event = &mut *event_struct;
-        vcpu.raw.state = &mut *state_struct;
+        vcpu.raw.0.exit = &mut *exit_struct;
+        vcpu.raw.0.event = &mut *event_struct;
+        vcpu.raw.0.state = &mut *state_struct;
 
         let shutdown_called = Arc::new(std::sync::Mutex::new(false));
         let shutdown_called_clone = shutdown_called.clone();

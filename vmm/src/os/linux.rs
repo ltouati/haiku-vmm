@@ -1,7 +1,7 @@
-use crate::devices::virtio::virtio_console::ConsoleDevice;
 use crate::devices::virtio::virtio_blk::BlockDevice;
-use crate::devices::virtio::virtio_rng::RngDevice;
+use crate::devices::virtio::virtio_console::ConsoleDevice;
 use crate::devices::virtio::virtio_mmio_device::MmioVirtioDevice;
+use crate::devices::virtio::virtio_rng::RngDevice;
 use anyhow::{Context, anyhow};
 use signal_hook::consts::SIGUSR1;
 use std::fs::File;
@@ -24,10 +24,6 @@ use crate::devices::pic::Pic;
 use crate::devices::pit::Pit;
 use crate::devices::serial::SerialConsole;
 
-use crate::nvmm::sys;
-use crate::nvmm::vcpu::regs;
-use crate::{Machine, Vcpu, VmAction};
-
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,6 +35,13 @@ use vm_device::device_manager::MmioManager; // Trait for register_mmio
 use vm_device::device_manager::PioManager; // Trait for register_pio
 
 // iced-x86 for robust decoding
+use crate::system::Machine;
+use crate::system::backend::HypervisorBackend;
+use crate::system::nvmm::sys;
+use crate::system::nvmm::sys::NvmmX64State;
+use crate::system::vmachine::regs;
+use crate::system::vmachine::vcpu::Vcpu;
+use crate::types::VmAction;
 use iced_x86::{Decoder, DecoderOptions};
 
 // CPU / Boot Constants
@@ -173,10 +176,10 @@ impl Linux64Guest {
         let _ = unsafe { signal_hook::low_level::register(SIGUSR1, || {}) };
     }
 
-    pub fn load<'a>(
+    pub fn load<'a, B: HypervisorBackend>(
         &self,
-        machine: &'a mut Machine,
-    ) -> anyhow::Result<(GuestMemoryMmap, Vcpu<'a>)> {
+        machine: &'a mut Machine<B>,
+    ) -> anyhow::Result<(GuestMemoryMmap, Vcpu<'a, B>)> {
         // 1. Setup Memory
         let guest_mem = self.setup_memory(machine)?;
 
@@ -198,7 +201,10 @@ impl Linux64Guest {
         Ok((guest_mem, vcpu))
     }
 
-    fn setup_memory(&self, machine: &mut Machine) -> anyhow::Result<GuestMemoryMmap> {
+    fn setup_memory<B: HypervisorBackend>(
+        &self,
+        machine: &mut Machine<B>,
+    ) -> anyhow::Result<GuestMemoryMmap> {
         let mem_size = self.memory_size_mib * 1024 * 1024;
         let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size as usize)])
             .map_err(|e| io::Error::other(format!("{:?}", e)))?;
@@ -314,26 +320,26 @@ impl Linux64Guest {
             guest_mem,
         )
         .map_err(|e| io::Error::other(format!("Failed to write boot params: {:?}", e)))?;
-
+        info!("Final cmdline: {}", cmdline);
         let mut cmdline_bytes = cmdline.as_bytes().to_vec();
         cmdline_bytes.push(0); // Null terminator
         guest_mem.write_slice(&cmdline_bytes, GuestAddress(BOOT_CMD_START))?;
         Ok(())
     }
 
-    fn setup_vcpu_state<'a>(
+    fn setup_vcpu_state<'a, B: HypervisorBackend>(
         &self,
-        machine: &'a mut Machine,
+        machine: &'a mut Machine<B>,
         guest_mem: &GuestMemoryMmap,
         entry_point: u64,
-    ) -> anyhow::Result<Vcpu<'a>> {
+    ) -> anyhow::Result<Vcpu<'a, B>> {
         let mut vcpu = machine.create_vcpu(0)?;
 
         // Create TSS (Required for NVMM)
         guest_mem.write_slice(&[0u8; 104], GuestAddress(TSS_START))?;
 
         // Registers
-        let mut state = sys::NvmmX64State::default();
+        let mut state = NvmmX64State::default();
 
         state.gprs[regs::GPR_RIP] = entry_point;
         state.gprs[regs::GPR_RSP] = BOOT_STACK_POINTER;
@@ -421,9 +427,9 @@ impl Linux64Guest {
         Ok(vcpu)
     }
 
-    pub async fn run<'a>(
+    pub async fn run<'a, B: HypervisorBackend + 'static>(
         &self,
-        vcpu: &mut Vcpu<'a>,
+        vcpu: &mut Vcpu<'a, B>,
         guest_mem: &GuestMemoryMmap,
     ) -> anyhow::Result<()> {
         info!("Starting VCPU...");
@@ -536,7 +542,7 @@ impl Linux64Guest {
         let i8042 = Arc::new(Mutex::new(I8042Wrapper::new(reset_evt.clone())));
 
         // Initialize VirtIO Console (Early for Scope)
-        let virtio_console = Arc::new(Mutex::new(MmioVirtioDevice(ConsoleDevice::new()?)));
+        let virtio_console = Arc::new(Mutex::new(MmioVirtioDevice(ConsoleDevice::<B>::new()?)));
 
         {
             let mut device_mgr = vcpu
@@ -655,7 +661,9 @@ impl Linux64Guest {
                     .write(true)
                     .open(disk_path)
                     .context("Failed to open disk image")?;
-                let virtio_blk = Arc::new(Mutex::new(MmioVirtioDevice(BlockDevice::new(disk_file)?)));
+                let virtio_blk = Arc::new(Mutex::new(MmioVirtioDevice(BlockDevice::<B>::new(
+                    disk_file,
+                )?)));
                 {
                     let mut blk = virtio_blk.lock().expect("Poisoned lock");
                     blk.set_memory(guest_mem.clone());
@@ -673,7 +681,7 @@ impl Linux64Guest {
             // Initialize VirtIO RNG
             {
                 info!("Initializing VirtIO RNG");
-                let virtio_rng = Arc::new(Mutex::new(MmioVirtioDevice(RngDevice::new()?)));
+                let virtio_rng = Arc::new(Mutex::new(MmioVirtioDevice(RngDevice::<B>::new()?)));
                 {
                     let mut rng = virtio_rng.lock().expect("Poisoned lock");
                     rng.set_memory(guest_mem.clone());
@@ -913,9 +921,17 @@ impl Linux64Guest {
                             .map_err(|e| anyhow!("MMIO Read Error at {:#x}: {:?}", gpa, e))?;
 
                         let val = u64::from_le_bytes(data);
+                        let mask = match size {
+                            1 => 0xFF,
+                            2 => 0xFFFF,
+                            4 => 0xFFFF_FFFF_FFFF_FFFF, // Zero extend
+                            8 => 0xFFFF_FFFF_FFFF_FFFF,
+                            _ => 0xFFFF_FFFF_FFFF_FFFF,
+                        };
                         Ok(VmAction::WriteRegAndContinue {
                             reg,
                             val,
+                            mask,
                             advance_rip: final_len,
                         })
                     }

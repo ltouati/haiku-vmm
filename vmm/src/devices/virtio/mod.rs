@@ -5,15 +5,18 @@
 //! Implements virtio devices, queues, and transport mechanisms.
 #![allow(dead_code)]
 
-use std::cmp;
-use std::convert::TryFrom;
-
+use crate::devices::pic::Pic;
 use futures::channel::oneshot;
 use serde::Deserialize;
 use serde::Serialize;
+use std::cmp;
+use std::convert::TryFrom;
+use std::sync::{Arc, Mutex};
 use virtio_bindings::virtio_config::{VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1};
 use virtio_bindings::virtio_ids;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+use virtio_device::VirtioConfig;
+use virtio_queue::Queue;
 
 const DEVICE_RESET: u32 = 0x0;
 
@@ -23,8 +26,8 @@ const INTERRUPT_STATUS_CONFIG_CHANGED: u32 = 0x2;
 const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
 pub mod virtio_blk;
 pub mod virtio_console;
-pub mod virtio_rng;
 pub mod virtio_mmio_device;
+pub mod virtio_rng;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -178,4 +181,20 @@ pub(crate) enum StoppedWorker<Q> {
     /// has gone wrong (and will be in the error log). In the case of a device
     /// reset this is fine since the next activation will replace the queues.
     MissingQueues,
+}
+pub fn default_signal_interrupt(
+    config: &mut VirtioConfig<Queue>,
+    pic: Option<&Arc<Mutex<Pic>>>,
+    irq_line: u8,
+) {
+    config
+        .interrupt_status
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    // Route through PIC (Pulse)
+    if let Some(pic) = &pic {
+        let mut p = pic.lock().unwrap();
+        p.set_irq(irq_line, true);
+        p.set_irq(irq_line, false);
+    }
 }

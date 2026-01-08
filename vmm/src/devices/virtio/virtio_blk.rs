@@ -9,25 +9,25 @@ use virtio_blk::request::{Request, RequestType};
 use virtio_device::{VirtioConfig, VirtioDeviceActions, VirtioDeviceType, VirtioMmioDevice};
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 
-
 use vm_memory::{Bytes, GuestMemoryMmap};
 
-use crate::VcpuInjector;
 use crate::devices::pic::Pic;
-use crate::devices::virtio::DeviceType;
+use crate::devices::virtio::{DeviceType, default_signal_interrupt};
+use crate::system::backend::HypervisorBackend;
+use crate::system::vmachine::vcpu::VcpuInjector;
 use std::sync::{Arc, Mutex};
 
 /// VirtIO Block Device using rust-vmm components.
-pub struct BlockDevice {
+pub struct BlockDevice<B: HypervisorBackend> {
     config: VirtioConfig<Queue>,
     disk_file: File,
     guest_mem: Option<GuestMemoryMmap>,
-    injector: Option<VcpuInjector>,
+    injector: Option<VcpuInjector<B>>,
     pic: Option<Arc<Mutex<Pic>>>,
     irq_line: u8,
 }
 
-impl BlockDevice {
+impl<B: HypervisorBackend> BlockDevice<B> {
     pub fn new(disk_file: File) -> anyhow::Result<Self> {
         // Block device usually has 1 queue.
 
@@ -80,20 +80,20 @@ impl BlockDevice {
         self.guest_mem = Some(mem);
     }
 
-    pub fn set_injector(&mut self, injector: VcpuInjector, pic: Arc<Mutex<Pic>>, line: u8) {
+    pub fn set_injector(&mut self, injector: VcpuInjector<B>, pic: Arc<Mutex<Pic>>, line: u8) {
         self.injector = Some(injector);
         self.pic = Some(pic);
         self.irq_line = line;
     }
 }
 
-impl VirtioDeviceType for BlockDevice {
+impl<B: HypervisorBackend> VirtioDeviceType for BlockDevice<B> {
     fn device_type(&self) -> u32 {
         DeviceType::Block as u32
     }
 }
 
-impl VirtioDeviceActions for BlockDevice {
+impl<B: HypervisorBackend> VirtioDeviceActions for BlockDevice<B> {
     type E = anyhow::Error;
 
     fn activate(&mut self) -> anyhow::Result<()> {
@@ -107,20 +107,21 @@ impl VirtioDeviceActions for BlockDevice {
     }
 }
 
-impl Borrow<VirtioConfig<Queue>> for BlockDevice {
+impl<B: HypervisorBackend> Borrow<VirtioConfig<Queue>> for BlockDevice<B> {
     fn borrow(&self) -> &VirtioConfig<Queue> {
         &self.config
     }
 }
 
-impl BorrowMut<VirtioConfig<Queue>> for BlockDevice {
+impl<B: HypervisorBackend> BorrowMut<VirtioConfig<Queue>> for BlockDevice<B> {
     fn borrow_mut(&mut self) -> &mut VirtioConfig<Queue> {
         &mut self.config
     }
 }
 
-impl VirtioMmioDevice for BlockDevice {
+impl<B: HypervisorBackend> VirtioMmioDevice for BlockDevice<B> {
     fn queue_notify(&mut self, val: u32) {
+        println!("VirtIO Block Notify: {}", val);
         log::debug!("VirtIO Block Notify: {}", val);
 
         let mem = match self.guest_mem.as_ref() {
@@ -149,35 +150,25 @@ impl VirtioMmioDevice for BlockDevice {
 
                 let used_len = Self::process_request(&mut self.disk_file, &request, &mut chain);
 
-                if queue.add_used(mem, chain.head_index(), used_len).is_ok() {
-                    needs_interrupt |= queue.needs_notification(mem).unwrap_or(true);
+                if queue.add_used(mem, chain.head_index(), used_len).is_ok()
+                    && queue.needs_notification(mem).unwrap_or(true)
+                {
+                    needs_interrupt = true;
                 }
             }
         }
-
-        if needs_interrupt && let Some(_injector) = &mut self.injector {
-            self.config
-                .interrupt_status
-                .store(1, std::sync::atomic::Ordering::SeqCst);
-
-            // Route through PIC (Pulse)
-            if let Some(pic) = &self.pic {
-                let mut p = pic.lock().unwrap();
-                p.set_irq(self.irq_line, true);
-                p.set_irq(self.irq_line, false);
-            }
-
-            // Manual Injection Removed - Handled by PIC Polling
-            /* if let Some(inj) = &mut self.injector {
-                let _ = inj.inject_interrupt(self.irq_line as u8);
-            } */
+        println!("Processing done, need interrupt={needs_interrupt}");
+        if needs_interrupt {
+            self.signal_interrupt();
         }
     }
 }
 
+impl<B: HypervisorBackend> BlockDevice<B> {
+    fn signal_interrupt(&mut self) {
+        default_signal_interrupt(&mut self.config, self.pic.as_ref(), self.irq_line)
+    }
 
-
-impl BlockDevice {
     fn process_request(
         disk_file: &mut std::fs::File,
         request: &Request,
@@ -185,6 +176,7 @@ impl BlockDevice {
     ) -> u32 {
         match request.request_type() {
             RequestType::In => {
+                println!("In request");
                 // Read from file
                 let sector = request.sector();
                 let offset = sector << SECTOR_SHIFT;
@@ -208,9 +200,11 @@ impl BlockDevice {
                     .write_obj(VIRTIO_BLK_S_OK as u8, request.status_addr())
                     .ok();
 
+                println!("Read {total_read} bytes from disk file, sector {sector}");
                 total_read as u32
             }
             RequestType::Out => {
+                println!("Out request");
                 let sector = request.sector();
                 let offset = sector << SECTOR_SHIFT;
                 let mut total_written = 0;
@@ -230,17 +224,23 @@ impl BlockDevice {
                     .memory()
                     .write_obj(VIRTIO_BLK_S_OK as u8, request.status_addr())
                     .ok();
-                0
+                println!("Wrote {total_written} bytes to disk file, sector {sector}");
+                total_written as u32
             }
             RequestType::Flush => {
+                println!("Flush request");
                 disk_file.sync_all().ok();
                 chain
                     .memory()
                     .write_obj(VIRTIO_BLK_S_OK as u8, request.status_addr())
                     .ok();
+                println!("Flushed disk file");
                 0
             }
-            _ => 0,
+            e => {
+                println!("Unsupported request type: {:?}", e);
+                0
+            }
         }
     }
 }
@@ -248,6 +248,7 @@ impl BlockDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system::backend::MockBackend;
     use tempfile::tempfile;
 
     #[test]
@@ -255,7 +256,7 @@ mod tests {
         let file = tempfile().unwrap();
         file.set_len(1024 * 1024).unwrap(); // 1MB
 
-        let dev = BlockDevice::new(file).unwrap();
+        let dev = BlockDevice::<MockBackend>::new(file).unwrap();
         assert_eq!(dev.device_type(), 2);
 
         // 1MB = 2048 sectors (512 bytes each)

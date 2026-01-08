@@ -8,12 +8,12 @@ use virtio_bindings::virtio_ring::VRING_DESC_F_WRITE;
 use virtio_device::{VirtioConfig, VirtioDeviceActions, VirtioDeviceType, VirtioMmioDevice};
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 
-
 use vm_memory::{Address, Bytes, GuestMemoryMmap};
 
-use crate::VcpuInjector;
 use crate::devices::pic::Pic;
-use crate::devices::virtio::DeviceType;
+use crate::devices::virtio::{DeviceType, default_signal_interrupt};
+use crate::system::backend::HypervisorBackend;
+use crate::system::vmachine::vcpu::VcpuInjector;
 
 // Config layout
 #[repr(C, packed)]
@@ -26,10 +26,10 @@ pub struct VirtioConsoleConfig {
 }
 
 /// VirtIO Console Device
-pub struct ConsoleDevice {
+pub struct ConsoleDevice<B: HypervisorBackend> {
     config: VirtioConfig<Queue>,
     guest_mem: Option<GuestMemoryMmap>,
-    injector: Option<VcpuInjector>,
+    injector: Option<VcpuInjector<B>>,
     pic: Option<Arc<Mutex<Pic>>>,
     irq_line: u8,
 
@@ -37,7 +37,7 @@ pub struct ConsoleDevice {
     rx_buffer: VecDeque<u8>,
 }
 
-impl ConsoleDevice {
+impl<B: HypervisorBackend> ConsoleDevice<B> {
     pub fn new() -> anyhow::Result<Self> {
         // Console has 2 queues: RX (0), TX (1)
         let mut queues = Vec::new();
@@ -83,7 +83,7 @@ impl ConsoleDevice {
         self.guest_mem = Some(mem);
     }
 
-    pub fn set_injector(&mut self, injector: VcpuInjector, pic: Arc<Mutex<Pic>>, line: u8) {
+    pub fn set_injector(&mut self, injector: VcpuInjector<B>, pic: Arc<Mutex<Pic>>, line: u8) {
         self.injector = Some(injector);
         self.pic = Some(pic);
         self.irq_line = line;
@@ -94,19 +94,14 @@ impl ConsoleDevice {
         self.rx_buffer.extend(data);
         // Try to process RX queue immediately if buffers are available
         match self.process_rx() {
-            Ok(true) => self.signal_irq(),
+            Ok(true) => self.signal_interrupt(),
             Ok(false) => {}
             Err(e) => log::error!("Failed to process RX on input: {:?}", e),
         }
     }
 
-    fn signal_irq(&mut self) {
-        if let (Some(_injector), Some(pic)) = (self.injector.as_mut(), &self.pic) {
-            let mut pic_lock = pic.lock().unwrap();
-            pic_lock.set_irq(self.irq_line, true);
-            pic_lock.set_irq(self.irq_line, false); // Pulse Logic
-            // let _ = injector.inject_interrupt(self.irq_line); // Handled by PIC Polling
-        }
+    fn signal_interrupt(&mut self) {
+        default_signal_interrupt(&mut self.config, self.pic.as_ref(), self.irq_line)
     }
 
     // Process RX Queue (0): Host -> Guest
@@ -233,15 +228,13 @@ impl ConsoleDevice {
     }
 }
 
-
-
-impl VirtioDeviceType for ConsoleDevice {
+impl<B: HypervisorBackend> VirtioDeviceType for ConsoleDevice<B> {
     fn device_type(&self) -> u32 {
         DeviceType::Console as u32
     }
 }
 
-impl VirtioDeviceActions for ConsoleDevice {
+impl<B: HypervisorBackend> VirtioDeviceActions for ConsoleDevice<B> {
     type E = anyhow::Error;
 
     fn activate(&mut self) -> anyhow::Result<()> {
@@ -256,30 +249,31 @@ impl VirtioDeviceActions for ConsoleDevice {
     }
 }
 
-impl Borrow<VirtioConfig<Queue>> for ConsoleDevice {
+impl<B: HypervisorBackend> Borrow<VirtioConfig<Queue>> for ConsoleDevice<B> {
     fn borrow(&self) -> &VirtioConfig<Queue> {
         &self.config
     }
 }
 
-impl BorrowMut<VirtioConfig<Queue>> for ConsoleDevice {
+impl<B: HypervisorBackend> BorrowMut<VirtioConfig<Queue>> for ConsoleDevice<B> {
     fn borrow_mut(&mut self) -> &mut VirtioConfig<Queue> {
         &mut self.config
     }
 }
 
-impl VirtioMmioDevice for ConsoleDevice {
+impl<B: HypervisorBackend> VirtioMmioDevice for ConsoleDevice<B> {
     fn queue_notify(&mut self, val: u32) {
+        println!("VirtIO Console Notify: {}", val);
         let res = match val {
             0 => self.process_rx(),
             1 => self.process_tx(),
             _ => Ok(false),
         };
-
+        println!("VirtIO Console Notify Result: {:?}", res);
         match res {
             Ok(needs_irq) => {
                 if needs_irq {
-                    self.signal_irq();
+                    self.signal_interrupt();
                 }
             }
             Err(e) => log::error!("Console queue error: {:?}", e),

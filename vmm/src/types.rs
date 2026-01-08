@@ -36,6 +36,7 @@ pub enum VmAction {
     WriteRegAndContinue {
         reg: usize,
         val: u64,
+        mask: u64,
         advance_rip: u64,
     },
     SetRip(u64),

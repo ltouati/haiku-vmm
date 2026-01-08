@@ -24,7 +24,9 @@ use std::io::{Read, Seek};
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use vm_memory::ByteValued;
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryBackend, GuestUsize, ReadVolatile};
+use vm_memory::{
+    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryBackend, GuestUsize, ReadVolatile,
+};
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use crate::loader_gen::bootparam;
